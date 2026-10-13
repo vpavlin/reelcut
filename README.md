@@ -19,11 +19,11 @@ cut from it took about 8 seconds each.
 
 ## With the container
 
-The image carries yt-dlp, ffmpeg, `parakeet-cli` and the model (about 1 GB):
+The image carries yt-dlp, ffmpeg, `parakeet-cli` and the model (about 1 GB),
+for amd64 and arm64:
 
 ```
-podman build -t reelcut .
-alias reelcut='podman run --rm -v "$PWD":/work:Z reelcut'
+alias reelcut='podman run --rm -v "$PWD":/work:Z ghcr.io/vpavlin/reelcut'
 reelcut fetch 'https://www.youtube.com/watch?v=…' /work/talk
 reelcut transcribe /work/talk
 reelcut prompt /work/talk > talk/prompt.txt     # give this to a model
@@ -31,6 +31,8 @@ reelcut prompt /work/talk > talk/prompt.txt     # give this to a model
 reelcut cut /work/talk /work/talk/clips.txt /work/talk/reels --fix Meakin=Mencken
 reelcut page /work/talk/reels --title "Highlights"
 ```
+
+To build it yourself: `podman build -t reelcut .`
 
 ## Without it
 
