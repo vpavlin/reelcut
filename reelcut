@@ -40,10 +40,11 @@ def fetch(a):
     run('yt-dlp', '-q', '--no-warnings', '-f', 'bestaudio', '-o', out('audio'),
         '--print-to-file', '%(title)s\t%(channel)s\t%(duration)s\t%(upload_date)s',
         os.path.join(a.dir, 'meta.tsv'), a.url)
-    # The shorter side, not the height: a portrait 1080p video is 1920 tall,
-    # and "height<=1080" quietly skips it.
-    run('yt-dlp', '-q', '--no-warnings', '-f',
-        'bv*[ext=mp4][height<=1080][width<=1920]/bv*[ext=mp4][width<=1080]/bv*[ext=mp4]/bv*',
+    # Ranked, not filtered: up to 1080p by the shorter side (yt-dlp's res, so
+    # a portrait 1080x1920 counts as 1080), then plain https over HLS, whose
+    # small fragments come throttled (a 97-minute video at 300 KB/s, and as
+    # 360p, under the old filter), then H.264.
+    run('yt-dlp', '-q', '--no-warnings', '-f', 'bv*', '-S', 'res:1080,proto:https,vcodec:h264,ext:mp4',
         '--remux-video', 'mp4', '-o', os.path.join(a.dir, 'video.%(ext)s'), a.url)
     print(open(os.path.join(a.dir, 'meta.tsv')).read().strip())
 

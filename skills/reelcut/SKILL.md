@@ -71,9 +71,10 @@ alias reelcut='podman run --rm -v "$PWD":/work:Z reelcut'   # paths below are th
 - Parakeet prints the word timings on **stderr**. Its stdout holds only the
   text. `reelcut` keeps both; a hand-rolled pipeline that drops stderr loses
   all the timings.
-- A portrait video's 1080p format is 1920 tall. `height<=1080` skips it and
-  YouTube then answers 403 for what is left. `fetch` selects by the shorter
-  side.
+- A portrait video's 1080p format is 1920 tall: a `height<=1080` filter
+  skips it. `fetch` ranks formats instead (`-S res:1080,proto:https,…`,
+  where res is the shorter side) and prefers plain https: HLS (m3u8)
+  formats come in throttled fragments, about 300 KB/s.
 - yt-dlp falls behind YouTube; an HTTP 403 on everything usually means
   `yt-dlp -U`, or rebuilding the image.
 - Initials ("H. L.") are not sentence ends. `reelcut` knows this, so don't
