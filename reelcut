@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""reelcut: from a long video to short vertical reels with burned-in captions.
+
+  reelcut fetch URL DIR             the audio and the video, with yt-dlp
+  reelcut transcribe DIR            word-level transcript, with Parakeet
+  reelcut prompt DIR                what to ask a model to pick the clips
+  reelcut cut DIR CLIPS OUT         the reels, from a list of clips
+  reelcut page OUT [--title T]      an index.html that plays them
+
+DIR holds one recording: audio.*, video.mp4, and what transcribe writes
+(words.json, transcript-ts.txt, transcript.txt). The steps are separate so a
+person, or any model, can pick the clips between transcribe and cut.
+"""
+import argparse, glob, html, json, os, re, shutil, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+MODEL = os.environ.get('REELCUT_MODEL', os.path.expanduser('~/.local/share/whisper/ggml-parakeet-tdt-0.6b-v3-q4_k.bin'))
+PARAKEET = os.environ.get('REELCUT_PARAKEET', shutil.which('parakeet-cli') or os.path.expanduser('~/.local/bin/parakeet-cli'))
+PIECE = 60  # seconds per transcription piece
+
+FILLERS = {'um', 'umm', 'uh', 'uhh', 'uhm', 'er', 'erm', 'hmm', 'mm'}
+
+
+def run(*a, **kw):
+    return subprocess.run(a, check=True, **kw)
+
+
+def find(d, pattern):
+    hits = sorted(glob.glob(os.path.join(d, pattern)))
+    if not hits:
+        sys.exit(f'reelcut: no {pattern} in {d}')
+    return hits[0]
+
+
+# --- fetch -------------------------------------------------------------------
+
+def fetch(a):
+    os.makedirs(a.dir, exist_ok=True)
+    out = lambda name: os.path.join(a.dir, name + '.%(ext)s')
+    run('yt-dlp', '-q', '--no-warnings', '-f', 'bestaudio', '-o', out('audio'),
+        '--print-to-file', '%(title)s\t%(channel)s\t%(duration)s\t%(upload_date)s',
+        os.path.join(a.dir, 'meta.tsv'), a.url)
+    # The shorter side, not the height: a portrait 1080p video is 1920 tall,
+    # and "height<=1080" quietly skips it.
+    run('yt-dlp', '-q', '--no-warnings', '-f',
+        'bv*[ext=mp4][height<=1080][width<=1920]/bv*[ext=mp4][width<=1080]/bv*[ext=mp4]/bv*',
+        '--remux-video', 'mp4', '-o', os.path.join(a.dir, 'video.%(ext)s'), a.url)
+    print(open(os.path.join(a.dir, 'meta.tsv')).read().strip())
+
+
+# --- transcribe --------------------------------------------------------------
+
+def transcribe(a):
+    d = a.dir
+    p = os.path.join(d, 'p')
+    os.makedirs(p, exist_ok=True)
+    src = find(d, 'audio.*') if glob.glob(os.path.join(d, 'audio.*')) else find(d, 'video.*')
+    run('ffmpeg', '-loglevel', 'error', '-y', '-i', src, '-vn', '-ac', '1', '-ar', '16000',
+        '-f', 'segment', '-segment_time', str(PIECE), '-reset_timestamps', '1', os.path.join(p, '%04d.wav'))
+    wavs = sorted(glob.glob(os.path.join(p, '*.wav')))
+    cpus = os.cpu_count() or 4
+    jobs = a.jobs or max(1, cpus // a.threads)
+
+    def one(w):
+        # The word timings come on stderr, with the model's own chatter; the
+        # text alone is on stdout. Keep both.
+        with open(w + '.ps', 'w') as f:
+            subprocess.run([PARAKEET, '-m', MODEL, '-f', w, '-t', str(a.threads), '-ps'],
+                           stdout=f, stderr=subprocess.STDOUT, check=True)
+        return w
+
+    print(f'{len(wavs)} pieces of {PIECE} s, {jobs} at a time, {a.threads} threads each', file=sys.stderr)
+    with ThreadPoolExecutor(jobs) as ex:
+        for i, _ in enumerate(ex.map(one, wavs), 1):
+            print(f'\r{i}/{len(wavs)}', end='', file=sys.stderr)
+    print(file=sys.stderr)
+    words = parse_words(p)
+    json.dump([[round(s, 2), round(e, 2), w] for s, e, w in words], open(os.path.join(d, 'words.json'), 'w'))
+    sents = sentences(words)
+    with open(os.path.join(d, 'transcript-ts.txt'), 'w') as f:
+        for s in sents:
+            f.write(f'[{hms(s[0])}] {s[2]}\n')
+    with open(os.path.join(d, 'transcript.txt'), 'w') as f:
+        minute = -1
+        for s in sents:
+            if int(s[0] // 60) != minute:
+                minute = int(s[0] // 60)
+                f.write(f'\n[{hms(s[0])}] ')
+            f.write(s[2] + ' ')
+    print(f'{len(words)} words, {len(sents)} sentences: {d}/transcript-ts.txt')
+
+
+TOK = re.compile(r'word_start=(true|false) "(.*)"$')
+TT = re.compile(r't0=\s*(\d+) t1=\s*(\d+)')
+
+
+def parse_words(p):
+    """Words with start and end in seconds. Parakeet's token times are in
+    10 ms steps from the start of each piece."""
+    words = []
+    for f in sorted(glob.glob(os.path.join(p, '*.wav.ps'))):
+        off = int(os.path.basename(f).split('.')[0]) * PIECE
+        for line in open(f, errors='replace'):
+            m, t = TOK.search(line), TT.search(line)
+            if not (m and t):
+                continue
+            start, text = m.group(1) == 'true', m.group(2)
+            t0, t1 = off + int(t.group(1)) / 100, off + int(t.group(2)) / 100
+            piece = text.replace('▁', '')
+            if (start or text.startswith('▁') or not words) and piece:
+                words.append([t0, t1, piece])
+            elif words:
+                words[-1][1] = max(words[-1][1], t1)
+                words[-1][2] += piece
+    return words
+
+
+def is_end(w):
+    """A sentence ends at . ? !, but not at an initial like "H." or "L."."""
+    return w.endswith(('.', '?', '!')) and not re.fullmatch(r'[A-Z]\.', w)
+
+
+def sentences(words):
+    out, cur = [], []
+    for w in words:
+        cur.append(w)
+        if is_end(w[2]):
+            out.append((cur[0][0], cur[-1][1], ' '.join(x[2] for x in cur)))
+            cur = []
+    if cur:
+        out.append((cur[0][0], cur[-1][1], ' '.join(x[2] for x in cur)))
+    return out
+
+
+def hms(t):
+    t = int(t)
+    return f'{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}'
+
+
+def secs(s):
+    h, m, x = (int(v) for v in s.strip().split(':'))
+    return h * 3600 + m * 60 + x
+
+
+# --- prompt ------------------------------------------------------------------
+
+PROMPT = """Below is a timestamped transcript of a recording ({title}), one [H:MM:SS] per
+sentence; it is a machine transcription, so names may be misheard.
+
+Pick {n} clips, each {lo}-{hi} seconds, that work on their own without context:
+provocative, funny, quotable, a strong claim or a sharp one-liner. Skip
+pre-show and housekeeping, prefer a mix of speakers, start on the setup and
+end right after the punchline. Leave out anything whose point rests on a slur.
+
+Answer one clip per line, exactly:
+N | START H:MM:SS | END H:MM:SS | speaker | hook title (max 6 words) | until LASTWORD
+START is the stamp of the first sentence, END the stamp of the last sentence
+included, LASTWORD the last word of that sentence (it pins the cut when two
+sentences share a stamp).
+
+{transcript}"""
+
+
+def prompt(a):
+    meta = os.path.join(a.dir, 'meta.tsv')
+    title = open(meta).read().split('\t')[0] if os.path.exists(meta) else 'a recording'
+    print(PROMPT.format(title=title, n=a.n, lo=a.min, hi=a.max,
+                        transcript=open(os.path.join(a.dir, 'transcript-ts.txt')).read()))
+
+
+# --- cut ---------------------------------------------------------------------
+
+HEAD = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Cap,DejaVu Sans,74,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,5,2,2,70,70,{cap_v},1
+Style: Hook,DejaVu Sans,62,&H00FFFFFF,&H00FFFFFF,&H00202020,&HC0000000,1,0,0,0,100,100,0,0,3,18,0,8,60,60,{hook_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+
+def ts(t):
+    return f'{int(t // 3600)}:{int(t % 3600 // 60):02d}:{t % 60:05.2f}'
+
+
+def clip_lines(path):
+    for line in open(path):
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) >= 5 and re.match(r'(CLIP\s*)?\d+$', parts[0], re.I):
+            yield parts
+
+
+def cut(a):
+    words = json.load(open(os.path.join(a.dir, 'words.json')))
+    video = find(a.dir, 'video.*')
+    audio = find(a.dir, 'audio.*') if glob.glob(os.path.join(a.dir, 'audio.*')) else video
+    fixes = dict(f.split('=', 1) for f in a.fix)
+    os.makedirs(a.out, exist_ok=True)
+    w, h = (int(x) for x in subprocess.check_output(
+        ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height',
+         '-of', 'csv=p=0:s=x', video], text=True).strip().split('x'))
+    # A landscape recording is cut to 9:16 around its middle; a portrait one is
+    # scaled to 1080x1920 as it is.
+    frame = 'scale=-2:1920,crop=1080:1920' if w > h else 'scale=1080:1920'
+
+    def esc(s):
+        for k, v in fixes.items():
+            s = re.sub(r'\b' + re.escape(k) + r'\b', v, s)
+        s = re.sub(r'([A-Za-z])(\d)', r'\1 \2', s)  # "like60" -> "like 60"
+        return s.replace('\\', '').replace('{', '(').replace('}', ')')
+
+    for n, parts in enumerate(clip_lines(a.clips), 1):
+        start_s = secs(re.sub(r'(?i)^start\s*', '', parts[1]))
+        end_s = secs(re.sub(r'(?i)^end\s*', '', parts[2]))
+        hook = parts[4]
+        until = re.sub(r'(?i)^until\s*', '', parts[5]).strip().lower() if len(parts) > 5 else ''
+        i0 = next(i for i, x in enumerate(words) if x[0] >= start_s - 0.05)
+        j = next(i for i, x in enumerate(words) if x[0] >= end_s - 0.05)
+        norm = lambda s: re.sub(r'[^\w%]', '', s.lower())
+        if until:  # the first word matching LASTWORD at or after END
+            while j < len(words) - 1 and norm(words[j][2]) != norm(until):
+                j += 1
+        else:  # the end of the sentence starting at END
+            while j < len(words) - 1 and not is_end(words[j][2]):
+                j += 1
+        t0, t1 = words[i0][0] - 0.25, words[j][1] + 0.4
+        ws, capital = [], False
+        for x in words[i0:j + 1]:
+            if not a.keep_fillers and norm(x[2]) in FILLERS:
+                capital = capital or x[2][:1].isupper()
+                continue
+            if capital:
+                x = [x[0], x[1], x[2][:1].upper() + x[2][1:]]
+                capital = False
+            ws.append(x)
+        groups, g = [], []
+        for x in ws:
+            g.append(x)
+            if len(g) == 4 or x[2].endswith(('.', ',', '?', '!', ';', ':')):
+                groups.append(g)
+                g = []
+        if g:
+            groups.append(g)
+        ev = [f'Dialogue: 1,{ts(0)},{ts(3.5)},Hook,,0,0,0,,{esc(hook.upper())}']
+        for gi, g in enumerate(groups):
+            g_end = groups[gi + 1][0][0] if gi + 1 < len(groups) else g[-1][1] + 0.3
+            for wi, x in enumerate(g):
+                s = x[0] - t0
+                e = (g[wi + 1][0] if wi + 1 < len(g) else g_end) - t0
+                text = ' '.join(('{\\c&H00E5FF&}' + esc(y[2]) + '{\\c&HFFFFFF&}') if y is x else esc(y[2]) for y in g)
+                ev.append(f'Dialogue: 0,{ts(s)},{ts(max(e, s + 0.05))},Cap,,0,0,0,,{text}')
+        slug = re.sub(r'[^a-z0-9]+', '-', hook.lower()).strip('-')[:40]
+        base = os.path.join(a.out, f'{n:02d}-{slug}')
+        open(base + '.ass', 'w').write(HEAD.format(cap_v=a.caption_margin, hook_v=a.hook_margin) + '\n'.join(ev) + '\n')
+        dur = t1 - t0
+        run('ffmpeg', '-loglevel', 'error', '-y', '-ss', f'{t0:.2f}', '-i', video, '-ss', f'{t0:.2f}', '-i', audio,
+            '-t', f'{dur:.2f}', '-map', '0:v', '-map', '1:a',
+            '-vf', f"{frame},ass={base}.ass,fade=in:st=0:d=0.2,fade=out:st={dur - 0.3:.2f}:d=0.3",
+            '-af', f'afade=in:st=0:d=0.15,afade=out:st={dur - 0.3:.2f}:d=0.3',
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', base + '.mp4')
+        last = ' '.join(x[2] for x in words[max(i0, j - 3):j + 1])
+        print(f'{base}.mp4  {dur:.1f}s  {ts(t0)} → {ts(t1)}  …{last}')
+
+
+# --- page --------------------------------------------------------------------
+
+def page(a):
+    clips = sorted(f for f in os.listdir(a.out) if f.endswith('.mp4'))
+    title = lambda f: re.sub(r'^\d+-', '', f[:-4]).replace('-', ' ').capitalize()
+    cards = '\n'.join(f'<figure><video src="{html.escape(f)}" controls preload="metadata" playsinline></video>'
+                      f'<figcaption><b>{html.escape(title(f))}</b> <a href="{html.escape(f)}" download>download</a>'
+                      f'</figcaption></figure>' for f in clips)
+    t = html.escape(a.title)
+    open(os.path.join(a.out, 'index.html'), 'w').write(f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{t}</title><style>
+:root{{--bg:#f6f5f2;--fg:#1d1d1b;--muted:#6b6a66;--card:#fff;--line:#e3e1dc}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#121211;--fg:#ecebe7;--muted:#9a9893;--card:#1c1c1a;--line:#2c2c29}}}}
+body{{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}}
+main{{max-width:1200px;margin:0 auto;padding:24px 16px 48px}} h1{{font-size:1.5rem;margin:0 0 20px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:20px}}
+figure{{margin:0;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}}
+video{{display:block;width:100%;aspect-ratio:9/16;background:#000}}
+figcaption{{padding:10px 12px;font-size:.92rem}} figcaption a{{float:right;color:var(--muted)}}
+</style></head><body><main><h1>{t}</h1><div class="grid">
+{cards}
+</div></main></body></html>
+''')
+    print(os.path.join(a.out, 'index.html'))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='reelcut', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('fetch'); s.add_argument('url'); s.add_argument('dir'); s.set_defaults(fn=fetch)
+    s = sub.add_parser('transcribe'); s.add_argument('dir')
+    s.add_argument('--threads', type=int, default=4, help='per piece (default 4)')
+    s.add_argument('--jobs', type=int, default=0, help='pieces at once (default: cores / threads)')
+    s.set_defaults(fn=transcribe)
+    s = sub.add_parser('prompt'); s.add_argument('dir'); s.add_argument('-n', type=int, default=6)
+    s.add_argument('--min', type=int, default=20); s.add_argument('--max', type=int, default=55); s.set_defaults(fn=prompt)
+    s = sub.add_parser('cut'); s.add_argument('dir'); s.add_argument('clips'); s.add_argument('out')
+    s.add_argument('--fix', action='append', default=[], metavar='HEARD=MEANT', help='fix a misheard word in the captions')
+    s.add_argument('--keep-fillers', action='store_true', help='keep um and uh in the captions')
+    s.add_argument('--caption-margin', type=int, default=470, help='captions, px from the bottom of 1920')
+    s.add_argument('--hook-margin', type=int, default=1190, help='hook title, px from the top of 1920')
+    s.set_defaults(fn=cut)
+    s = sub.add_parser('page'); s.add_argument('out'); s.add_argument('--title', default='Reels'); s.set_defaults(fn=page)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == '__main__':
+    main()
