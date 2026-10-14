@@ -35,6 +35,12 @@ alias reelcut='podman run --rm -v "$PWD":/work:z reelcut'   # paths below are th
    are, and use the names when cutting (`--speakers "A=Petty,B=Václav"`).
    With the wrong speaker count, two people merge into one voice; check that
    the talk times it prints look right.
+   **Steer the picking:** ask what the person is after (topics, people,
+   tone) and pass it as `prompt --brief "…"`. Ask for more candidates than
+   will be cut (`-n 12`), show them with their one-sentence summaries, and
+   cut only the chosen ones (`cut --only 2,5,7`). Offer `--lead/--tail/--fade`
+   for softer edges and `--intro/--outro IMAGE` for opening and closing
+   cards (a logo, a QR code, a URL).
 3. **Summarise or pick:** `reelcut prompt DIR` prints the instructions and
    the transcript, which can go to any model. To save your own quota, hand
    the transcript to a cheaper agent: put it where that agent can read it,

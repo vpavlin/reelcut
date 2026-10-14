@@ -60,12 +60,24 @@ dims whoever is listening, and `--frame speaker` cuts to whoever speaks.
 Voices are matched to faces by whose mouth moves while each one talks; if
 it gets that wrong, say where each sits: `A=Petty@left`.
 
+## Choosing and styling
+
+- `prompt -n 12 --brief "privacy, cypherpunk history; sharp over long"`
+  asks for 12 candidates, best first, each with a sentence on what is said,
+  steered by what you are after. Lengths follow the moment, within
+  `--min`/`--max` seconds.
+- `cut --only 2,5,7` cuts just the ones you chose.
+- `--lead 1.5 --tail 1.5 --fade 0.8` gives each clip room before and after,
+  faded in and out, picture and sound.
+- `--intro logo.png --outro qr.png --card 2` puts a card before and after:
+  an image fitted on black, faded in and out.
+
 ## The clips file
 
 One clip per line, as `reelcut prompt` asks for:
 
 ```
-1 | 0:35:52 | 0:36:32 | Sal | Blockchain analytics is voodoo | until voodoo
+1 | 0:35:52 | 0:36:32 | Sal | Blockchain analytics is voodoo | until voodoo | why it works
 ```
 
 START is the stamp of the first sentence, END the stamp of the last sentence,
