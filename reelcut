@@ -433,7 +433,7 @@ def face_samples(video, t0, t1, fps=5.0):
     return samples, tracks, W, H
 
 
-def face_window(frame, W, H, cx, cy, fh, aspect, faces=3.2, least=0.5):
+def face_window(frame, W, H, cx, cy, fh, aspect, faces=3.2, least=0.5, eyes=1 / 3):
     """A crop (w, h, x, y) of the given aspect (w/h) around a face: about
     `faces` face heights tall but at least `least` of the frame, the face in
     its upper third, and kept inside the picture around the face (a call's
@@ -464,10 +464,10 @@ def face_window(frame, W, H, cx, cy, fh, aspect, faces=3.2, least=0.5):
     if cw > bx1 - bx0:
         cw, ch = bx1 - bx0, (bx1 - bx0) / aspect
     cw, ch = int(cw) // 2 * 2, int(ch) // 2 * 2
-    return cw, ch, int(min(max(bx0, cx - cw / 2), bx1 - cw)), int(min(max(by0, cy - ch / 3), by1 - ch))
+    return cw, ch, int(min(max(bx0, cx - cw / 2), bx1 - cw)), int(min(max(by0, cy - ch * eyes), by1 - ch))
 
 
-def turn_shots(video, t0, t1, turns, fps=5.0, place=None):
+def turn_shots(video, t0, t1, turns, fps=5.0, place=None, places=None):
     """Speaker mode with labelled turns (diarize): each turn a still crop
     around the face of whoever speaks it, their voice matched to a face; a
     face not on screen in its turn gives way to the largest one that is, and
@@ -475,7 +475,7 @@ def turn_shots(video, t0, t1, turns, fps=5.0, place=None):
     import numpy as np
     samples, tracks, W, H = face_samples(video, t0, t1, fps)
     people = pool_people(samples, tracks, W)
-    who = voice_faces(samples, people, turns, t0)
+    who = placed(people, places, W) if places else voice_faces(samples, people, turns, t0)
     by_x = sorted(range(len(people)), key=lambda k: people[k]['cx'])
     for spk, side in (place or {}).items():
         if by_x:
@@ -642,6 +642,10 @@ def clip_turns(words, t0, t1, least=1.0):
             out[-1][1] = r[1]
         else:
             out.append(r)
+    # A sliver of another voice at the very start is not a turn either.
+    if len(out) > 1 and out[0][1] - out[0][0] < least:
+        out[1][0] = 0.0
+        out.pop(0)
     return out
 
 
@@ -667,7 +671,59 @@ def voice_faces(samples, people, turns, t0):
     return out
 
 
-def stack_layout(video, t0, t1, fps=3.0, turns=None, place=None):
+def speaker_places(video, words, t0, t1):
+    """Where each voice sits in the picture around a clip, {speaker: x}, and
+    the stretch it was learnt on. A clip where only one person talks cannot
+    tell faces apart by who moves with which voice, so the match is made on
+    the stretch around the clip, widened until two voices have each spoken
+    for a while: around the clip rather than anywhere in the recording,
+    because a recording can change layouts (full frame, then a call's tiles)
+    and a place learnt in one layout is wrong in another."""
+    labelled = [x for x in words if len(x) > 3]
+    if not labelled:
+        return {}, (t0, t1)
+    mid = (t0 + t1) / 2
+    a, b = t0, t1
+    for pad in (30, 60, 120, 240, 480):
+        a, b = max(0.0, mid - pad), mid + pad
+        talk = {}
+        for x in labelled:
+            if a <= x[0] <= b:
+                talk[x[3]] = talk.get(x[3], 0) + x[1] - x[0]
+        if sum(1 for v in talk.values() if v >= 10) >= 2:
+            break
+    stretch = [x for x in labelled if a <= x[0] <= b]
+    turns = clip_turns(stretch, a, b) or []
+    if len({t[2] for t in turns}) < 2:
+        return {}, (a, b)
+    samples, tracks, W, H = face_samples(video, a, b, 2.0)
+    people = pool_people(samples, tracks, W)
+    who = voice_faces(samples, people, turns, a)
+    places = {spk: people[k]['cx'] for spk, k in who.items()}
+    if os.environ.get('REELCUT_DEBUG'):
+        print(f'    voices placed from {hms(a)}-{hms(b)}: ' +
+              ', '.join(f'{spk} at x={int(x)}' for spk, x in sorted(places.items())), file=sys.stderr)
+    return places, (a, b)
+
+
+def placed(people, places, W):
+    """{speaker: index in people}, by where each voice sits; one person per
+    voice, the nearer one keeping it."""
+    out, dist = {}, {}
+    for spk, x in places.items():
+        near = min(range(len(people)), key=lambda k: abs(people[k]['cx'] - x), default=None)
+        if near is None or abs(people[near]['cx'] - x) >= W * 0.15:
+            continue
+        d = abs(people[near]['cx'] - x)
+        other = next((o for o, k in out.items() if k == near), None)
+        if other is None or d < dist[other]:
+            if other is not None:
+                del out[other]
+            out[spk], dist[spk] = near, d
+    return out
+
+
+def stack_layout(video, t0, t1, fps=3.0, turns=None, place=None, places=None):
     """Two people, one above the other (--frame stack): the two faces seen
     most in the clip, the one further left on top, each a 1080x960 crop
     around them. None when the clip does not show two people for most of it.
@@ -684,7 +740,9 @@ def stack_layout(video, t0, t1, fps=3.0, turns=None, place=None):
         cy = float(np.median([s[1][i][2] for s, i in seen]))
         fh = float(np.median([s[1][i][3] for s, i in seen]))
         frame = seen[len(seen) // 2][0][2]
-        crops.append(face_window(frame, W, H, p['cx'], cy, fh, 1080 / 960, faces=2.0, least=0.2))
+        # Head and shoulders with room above: a small call tile zoomed to
+        # two face heights filled the half with a head and cut its top.
+        crops.append(face_window(frame, W, H, p['cx'], cy, fh, 1080 / 960, faces=2.8, least=0.3, eyes=0.42))
     stacked = ('stack', crops[0], crops[1])
     # Stacked where both are on screen; where the recording shows one person
     # (a full-frame shot between call layouts), a crop around them; where
@@ -728,7 +786,7 @@ def stack_layout(video, t0, t1, fps=3.0, turns=None, place=None):
     # Who speaks, on top or below: their voice matched to a face (or as the
     # person named them, left/right), and the listener's half dimmed for the
     # length of each turn.
-    who = voice_faces(samples, pair, turns, t0)
+    who = placed(pair, places, W) if places else voice_faces(samples, pair, turns, t0)
     for spk, side in (place or {}).items():
         who[spk] = 0 if side == 'left' else 1
     split = []
@@ -805,6 +863,7 @@ def cut(a):
         if side.strip() in ('left', 'right'):
             place[letter.strip().upper()] = side.strip()
     labelled = any(len(x) > 3 for x in words)
+    places, learnt = None, (0, 0)  # where each voice sits, and the stretch that says so
 
     def esc(s):
         for k, v in fixes.items():
@@ -859,7 +918,9 @@ def cut(a):
         finish = f"ass={base}.ass,fade=in:st=0:d=0.2,fade=out:st={dur - 0.3:.2f}:d=0.3"
         hv, cv = hook_margin, caption_margin
         turns = clip_turns(words[i0:j + 1], t0, t1) if labelled else None
-        shots = stack_layout(video, t0, t1, turns=turns, place=place) if stack else None
+        if turns and (stack or speaker) and not (places and learnt[0] <= t0 and t1 <= learnt[1]):
+            places, learnt = speaker_places(video, words, t0, t1)
+        shots = stack_layout(video, t0, t1, turns=turns, place=place, places=places) if stack else None
         if stack and shots is None:
             print('  not two people on screen for most of it: following the speaker instead')
         if shots:
@@ -873,7 +934,8 @@ def cut(a):
             # Each shot with its own look (a crop, two stacked, or fitted
             # where no face is seen), joined, then the captions over all.
             if not shots:
-                shots = turn_shots(video, t0, t1, turns, place=place) if turns else speaker_shots(video, t0, t1, audio)
+                shots = (turn_shots(video, t0, t1, turns, place=place, places=places) if turns
+                         else speaker_shots(video, t0, t1, audio))
                 if a.hook_margin is None and shots[0][2] is None:
                     hv = 470  # the first shot is a band: the hook above it
             parts = []
@@ -883,7 +945,7 @@ def cut(a):
                     (tw, th, tx, ty), (bw, bh, bx, by) = crop[1], crop[2]
                     active = crop[3] if len(crop) > 3 else None
                     # The one listening, a little dimmer, while the other speaks.
-                    dim = ',eq=brightness=-0.16:saturation=0.6'
+                    dim = ',eq=brightness=-0.08:saturation=0.8'
                     td = dim if active == 1 else ''
                     bd = dim if active == 0 else ''
                     parts.append(f'{head},split[t{k}][b{k}];[t{k}]crop={tw}:{th}:{tx}:{ty},scale=1080:960{td},setsar=1[t{k}c];'
