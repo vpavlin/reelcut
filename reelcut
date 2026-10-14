@@ -89,18 +89,31 @@ def transcribe(a):
     print(file=sys.stderr)
     words = parse_words(p)
     json.dump([[round(s, 2), round(e, 2), w] for s, e, w in words], open(os.path.join(d, 'words.json'), 'w'))
+    n = write_transcripts(d, words)
+    print(f'{len(words)} words, {n} sentences: {d}/transcript-ts.txt')
+
+
+def write_transcripts(d, words):
+    """transcript-ts.txt (a stamp per sentence) and transcript.txt (a stamp
+    per minute). Labelled words (diarize) put the sentence's speaker after
+    the stamp: "[0:03:42] B: …", the speaker who said most of it."""
     sents = sentences(words)
     with open(os.path.join(d, 'transcript-ts.txt'), 'w') as f:
         for s in sents:
-            f.write(f'[{hms(s[0])}] {s[2]}\n')
+            who = f'{s[3]}: ' if s[3] else ''
+            f.write(f'[{hms(s[0])}] {who}{s[2]}\n')
     with open(os.path.join(d, 'transcript.txt'), 'w') as f:
-        minute = -1
+        minute, last = -1, None
         for s in sents:
             if int(s[0] // 60) != minute:
                 minute = int(s[0] // 60)
                 f.write(f'\n[{hms(s[0])}] ')
+                last = None
+            if s[3] and s[3] != last:
+                f.write(f'{s[3]}: ')
+                last = s[3]
             f.write(s[2] + ' ')
-    print(f'{len(words)} words, {len(sents)} sentences: {d}/transcript-ts.txt')
+    return len(sents)
 
 
 TOK = re.compile(r'word_start=(true|false) "(.*)"$')
@@ -134,14 +147,21 @@ def is_end(w):
 
 
 def sentences(words):
+    """(start, end, text, speaker or None) per sentence; the speaker is who
+    said most of its words, when the words are labelled (diarize)."""
     out, cur = [], []
+
+    def close():
+        spk = [x[3] for x in cur if len(x) > 3]
+        who = max(set(spk), key=spk.count) if spk else None
+        out.append((cur[0][0], cur[-1][1], ' '.join(x[2] for x in cur), who))
     for w in words:
         cur.append(w)
         if is_end(w[2]):
-            out.append((cur[0][0], cur[-1][1], ' '.join(x[2] for x in cur)))
+            close()
             cur = []
     if cur:
-        out.append((cur[0][0], cur[-1][1], ' '.join(x[2] for x in cur)))
+        close()
     return out
 
 
@@ -153,6 +173,108 @@ def hms(t):
 def secs(s):
     h, m, x = (int(v) for v in s.strip().split(':'))
     return h * 3600 + m * 60 + x
+
+
+# --- diarize -----------------------------------------------------------------
+
+DIAR_SEG_URL = ('https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/'
+                'sherpa-onnx-pyannote-segmentation-3-0.tar.bz2')
+DIAR_SEG_SHA256 = '220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079'  # its model.onnx
+DIAR_EMB_URL = ('https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/'
+                'nemo_en_titanet_small.onnx')
+DIAR_EMB_SHA256 = 'ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e'
+
+
+def diar_models():
+    """pyannote segmentation 3.0 and TitaNet-small, as ONNX:
+    $REELCUT_DIAR_SEG / $REELCUT_DIAR_EMB, or fetched once into
+    ~/.cache/reelcut and checked."""
+    import hashlib, io, tarfile, urllib.request
+    cache = os.path.expanduser('~/.cache/reelcut')
+    seg = os.environ.get('REELCUT_DIAR_SEG') or os.path.join(cache, 'pyannote-segmentation-3.onnx')
+    emb = os.environ.get('REELCUT_DIAR_EMB') or os.path.join(cache, 'titanet-small.onnx')
+    os.makedirs(cache, exist_ok=True)
+    if not os.path.exists(seg):
+        raw = urllib.request.urlopen(DIAR_SEG_URL, timeout=120).read()
+        with tarfile.open(fileobj=io.BytesIO(raw), mode='r:bz2') as t:
+            data = t.extractfile(next(m for m in t.getmembers() if m.name.endswith('/model.onnx'))).read()
+        if hashlib.sha256(data).hexdigest() != DIAR_SEG_SHA256:
+            sys.exit('reelcut: the segmentation model did not match its checksum')
+        open(seg, 'wb').write(data)
+    if not os.path.exists(emb):
+        data = urllib.request.urlopen(DIAR_EMB_URL, timeout=120).read()
+        if hashlib.sha256(data).hexdigest() != DIAR_EMB_SHA256:
+            sys.exit('reelcut: the speaker embedding model did not match its checksum')
+        open(emb, 'wb').write(data)
+    return seg, emb
+
+
+def diarize(a):
+    """Who speaks when: every word in words.json gets a speaker (A, B, …, in
+    the order they first speak), and the transcripts say who said each
+    sentence. sherpa-onnx's offline diarization: pyannote finds the speech
+    and its turns, TitaNet tells the voices apart. Give --speakers when you
+    know how many people talk; without it they are counted by how alike the
+    voices are (--threshold)."""
+    import time
+    import numpy as np
+    import sherpa_onnx
+    d = a.dir
+    words = json.load(open(os.path.join(d, 'words.json')))
+    src = find(d, 'audio.*') if glob.glob(os.path.join(d, 'audio.*')) else find(d, 'video.*')
+    pcm = subprocess.run(['ffmpeg', '-loglevel', 'error', '-i', src, '-vn', '-ac', '1', '-ar', '16000',
+                          '-f', 's16le', '-'], capture_output=True, check=True).stdout
+    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768
+    seg, emb = diar_models()
+    threads = a.threads or min(os.cpu_count() or 4, 8)
+    cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=seg), num_threads=threads),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=emb, num_threads=threads),
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=a.speakers or -1, threshold=a.threshold),
+        min_duration_on=0.3, min_duration_off=0.5)
+    t = time.time()
+    segs = [(x.start, x.end, x.speaker) for x in
+            sherpa_onnx.OfflineSpeakerDiarization(cfg).process(audio).sort_by_start_time()]
+    took = time.time() - t
+    if not segs:
+        sys.exit('reelcut: no speech found to tell speakers apart in')
+    # Counted from the voices, a "speaker" with a few seconds in all is a
+    # fragment of someone (a laugh, a cough, a moment off the microphone):
+    # its stretches go to whoever speaks around them.
+    if not a.speakers:
+        talk = {}
+        for s0, s1, sp in segs:
+            talk[sp] = talk.get(sp, 0) + s1 - s0
+        tiny = {sp for sp, v in talk.items() if v < max(5.0, 0.02 * sum(talk.values()))}
+        if tiny and len(tiny) < len(talk):
+            for k, (s0, s1, sp) in enumerate(segs):
+                if sp in tiny:
+                    near = [x for x in segs[k - 1::-1] + segs[k + 1:] if x[2] not in tiny] if k else \
+                           [x for x in segs[k + 1:] if x[2] not in tiny]
+                    if near:
+                        segs[k] = (s0, s1, near[0][2])
+    # Letters in the order people first speak: A opens the recording.
+    order = {}
+    for _, _, sp in segs:
+        order.setdefault(sp, chr(65 + len(order)))
+    out = []
+    for w in words:
+        mid = (w[0] + w[1]) / 2
+        hit = [sp for s0, s1, sp in segs if s0 <= mid <= s1]
+        if not hit:  # between turns: the nearest
+            hit = [min(segs, key=lambda x: min(abs(x[0] - mid), abs(x[1] - mid)))[2]]
+        out.append([w[0], w[1], w[2], order[hit[0]]])
+    json.dump(out, open(os.path.join(d, 'words.json'), 'w'))
+    write_transcripts(d, out)
+    dur = len(audio) / 16000
+    talk = {}
+    for s0, s1, sp in segs:
+        talk[order[sp]] = talk.get(order[sp], 0) + s1 - s0
+    print(f'{len(order)} speakers in {dur:.0f} s of audio, told apart in {took:.0f} s '
+          f'({dur / max(took, 0.1):.0f}x real time): ' +
+          ', '.join(f'{k} {v / 60:.1f} min' for k, v in sorted(talk.items())))
+    print(f'{d}/transcript-ts.txt now says who said each sentence ("[0:03:42] B: …")')
 
 
 # --- prompt ------------------------------------------------------------------
@@ -183,6 +305,16 @@ def prompt(a):
 
 # --- cut ---------------------------------------------------------------------
 
+# A caption's colour by who says it (ASS colours are blue-green-red): white,
+# light blue, orange, green, pink. The word being said stays yellow.
+SPEAKER_COLOURS = ['&HFFFFFF&', '&HFFD38F&', '&H6CB8FF&', '&H8CF1B9&', '&HE0A0FF&']
+SAYING = '&H00E5FF&'
+
+
+def speaker_colour(letter):
+    return SPEAKER_COLOURS[(ord(letter) - 65) % len(SPEAKER_COLOURS)] if letter else SPEAKER_COLOURS[0]
+
+
 HEAD = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -193,6 +325,7 @@ WrapStyle: 0
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Cap,DejaVu Sans,74,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,5,2,2,70,70,{cap_v},1
 Style: Hook,DejaVu Sans,62,&H00FFFFFF,&H00FFFFFF,&H00202020,&HC0000000,1,0,0,0,100,100,0,0,3,18,0,8,60,60,{hook_v},1
+Style: Name,DejaVu Sans,44,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,2,0,1,4,1,2,70,70,{name_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -334,6 +467,40 @@ def face_window(frame, W, H, cx, cy, fh, aspect, faces=3.2, least=0.5):
     return cw, ch, int(min(max(bx0, cx - cw / 2), bx1 - cw)), int(min(max(by0, cy - ch / 3), by1 - ch))
 
 
+def turn_shots(video, t0, t1, turns, fps=5.0, place=None):
+    """Speaker mode with labelled turns (diarize): each turn a still crop
+    around the face of whoever speaks it, their voice matched to a face; a
+    face not on screen in its turn gives way to the largest one that is, and
+    a turn with no face is fitted."""
+    import numpy as np
+    samples, tracks, W, H = face_samples(video, t0, t1, fps)
+    people = pool_people(samples, tracks, W)
+    who = voice_faces(samples, people, turns, t0)
+    by_x = sorted(range(len(people)), key=lambda k: people[k]['cx'])
+    for spk, side in (place or {}).items():
+        if by_x:
+            who[spk] = by_x[0] if side == 'left' else by_x[-1]
+    shots = []
+    for a, b, spk in turns:
+        run_ = [s for s in samples if a <= s[0] - t0 < b and s[1]]
+        crop = None
+        if run_:
+            ids = people[who[spk]]['ids'] if spk in who else set()
+            mine = [(s, i) for s in run_ for i in s[1] if i in ids]
+            if not mine:
+                big = max(run_[len(run_) // 2][1], key=lambda i: run_[len(run_) // 2][1][i][4])
+                mine = [(s, big) for s in run_ if big in s[1]]
+            mid = mine[len(mine) // 2]
+            crop = face_window(mid[0][2], W, H, float(np.median([s[1][i][0] for s, i in mine])),
+                               float(np.median([s[1][i][2] for s, i in mine])),
+                               float(np.median([s[1][i][3] for s, i in mine])), 9 / 16)
+        if shots and shots[-1][2] == crop:
+            shots[-1][1] = b
+        else:
+            shots.append([a, b, crop])
+    return shots
+
+
 def speaker_shots(video, t0, t1, audio=None, fps=5.0, hold=1.0, lead=1.2, win=1.0):
     """The shots of a clip: [(start, end, crop or None)], times from t0, a
     crop (w, h, x, y) around whoever speaks, None where no face is seen (the
@@ -429,15 +596,11 @@ def speaker_shots(video, t0, t1, audio=None, fps=5.0, hold=1.0, lead=1.2, win=1.
     return shots or [[0.0, t1 - t0, None]]
 
 
-def stack_layout(video, t0, t1, fps=3.0):
-    """Two people, one above the other (--frame stack): the two faces seen
-    most in the clip, the one further left on top, each a 1080x960 crop
-    around them. None when the clip does not show two people for most of it.
-    No guessing who speaks: both are always on screen."""
+def pool_people(samples, tracks, W):
+    """Tracks pooled into people: a face whose track was lost and found again,
+    or seen in two runs, is one person where its positions agree. Each is
+    {'cx', 'ids', 'seen': [(sample, track)]}, the most seen first."""
     import numpy as np
-    samples, tracks, W, H = face_samples(video, t0, t1, fps)
-    # A face whose track was lost and found again is one person: tracks whose
-    # positions agree are pooled.
     people = []
     for i in tracks:
         seen = [s for s in samples if i in s[1]]
@@ -447,10 +610,71 @@ def stack_layout(video, t0, t1, fps=3.0):
         for p in people:
             if abs(p['cx'] - cx) < W * 0.08:
                 p['seen'] += [(s, i) for s in seen]
+                p['ids'].add(i)
                 break
         else:
-            people.append({'cx': cx, 'seen': [(s, i) for s in seen]})
+            people.append({'cx': cx, 'ids': {i}, 'seen': [(s, i) for s in seen]})
     people.sort(key=lambda p: -len(p['seen']))
+    return people
+
+
+def clip_turns(words, t0, t1, least=1.0):
+    """Who speaks when within a clip, from labelled words (diarize):
+    [[start, end, speaker]] from t0, covering the clip, turns shorter than
+    `least` seconds folded into the one before."""
+    runs = []
+    for x in words:
+        if len(x) < 4:
+            continue
+        a, b = x[0] - t0, x[1] - t0
+        if runs and runs[-1][2] == x[3]:
+            runs[-1][1] = b
+        else:
+            runs.append([a, b, x[3]])
+    if not runs:
+        return None
+    for k in range(len(runs) - 1):
+        runs[k][1] = runs[k + 1][0]
+    runs[0][0], runs[-1][1] = 0.0, t1 - t0
+    out = []
+    for r in runs:
+        if out and (r[1] - r[0] < least or out[-1][2] == r[2]):
+            out[-1][1] = r[1]
+        else:
+            out.append(r)
+    return out
+
+
+def voice_faces(samples, people, turns, t0):
+    """Which person each voice is: the one whose mouth moves most, against
+    their own usual, while that voice speaks. {speaker: index in people}."""
+    score = {}
+    for k, p in enumerate(people):
+        allv = [s[1][i][1] for s, i in p['seen']]
+        usual = (sum(allv) / len(allv)) if allv else 0
+        for spk in {t[2] for t in turns}:
+            during = [s[1][i][1] for s, i in p['seen']
+                      if any(t[2] == spk and t[0] <= s[0] - t0 < t[1] for t in turns)]
+            if during and usual > 0:
+                score[(spk, k)] = sum(during) / len(during) / usual
+    if os.environ.get('REELCUT_DEBUG'):
+        print('    voice to face: ' + ', '.join(f'{spk}->person{k} {v:.2f}' for (spk, k), v in sorted(score.items())),
+              file=sys.stderr)
+    out, taken = {}, set()
+    for (spk, k), v in sorted(score.items(), key=lambda kv: -kv[1]):
+        if spk not in out and k not in taken:
+            out[spk], taken = k, taken | {k}
+    return out
+
+
+def stack_layout(video, t0, t1, fps=3.0, turns=None, place=None):
+    """Two people, one above the other (--frame stack): the two faces seen
+    most in the clip, the one further left on top, each a 1080x960 crop
+    around them. None when the clip does not show two people for most of it.
+    No guessing who speaks: both are always on screen."""
+    import numpy as np
+    samples, tracks, W, H = face_samples(video, t0, t1, fps)
+    people = pool_people(samples, tracks, W)
     if len(people) < 2 or len(people[1]['seen']) < 0.3 * len(samples):
         return None
     pair = sorted(people[:2], key=lambda p: p['cx'])
@@ -499,7 +723,24 @@ def stack_layout(video, t0, t1, fps=3.0):
         else:
             out.append([a, b, look])
     out[0][0], out[-1][1] = 0.0, t1 - t0
-    return out
+    if not turns:
+        return out
+    # Who speaks, on top or below: their voice matched to a face (or as the
+    # person named them, left/right), and the listener's half dimmed for the
+    # length of each turn.
+    who = voice_faces(samples, pair, turns, t0)
+    for spk, side in (place or {}).items():
+        who[spk] = 0 if side == 'left' else 1
+    split = []
+    for a, b, look in out:
+        if not (look and look[0] == 'stack'):
+            split.append([a, b, look])
+            continue
+        for ta, tb, spk in turns:
+            lo, hi = max(a, ta), min(b, tb)
+            if hi - lo > 0.05:
+                split.append([lo, hi, look + (who.get(spk),)])
+    return split
 
 
 _ENCODER = None
@@ -553,6 +794,17 @@ def cut(a):
     stack = w > h and mode == 'stack'
 
     caption_margin = a.caption_margin if a.caption_margin is not None else 470
+    # Names for the speakers diarize found ("A=Petty,B=Václav"), and where
+    # they sit when the voices should not be matched to faces by guess
+    # ("A=Petty@left").
+    names, place = {}, {}
+    for item in filter(None, (x.strip() for x in (a.speakers or '').split(','))):
+        letter, _, rest = item.partition('=')
+        name, _, side = rest.partition('@')
+        names[letter.strip().upper()] = name.strip()
+        if side.strip() in ('left', 'right'):
+            place[letter.strip().upper()] = side.strip()
+    labelled = any(len(x) > 3 for x in words)
 
     def esc(s):
         for k, v in fixes.items():
@@ -598,14 +850,16 @@ def cut(a):
             for wi, x in enumerate(g):
                 s = x[0] - t0
                 e = (g[wi + 1][0] if wi + 1 < len(g) else g_end) - t0
-                text = ' '.join(('{\\c&H00E5FF&}' + esc(y[2]) + '{\\c&HFFFFFF&}') if y is x else esc(y[2]) for y in g)
+                text = ' '.join('{\\c' + (SAYING if y is x else speaker_colour(y[3] if len(y) > 3 else None)) + '}'
+                                + esc(y[2]) for y in g)
                 ev.append(f'Dialogue: 0,{ts(s)},{ts(max(e, s + 0.05))},Cap,,0,0,0,,{text}')
         slug = re.sub(r'[^a-z0-9]+', '-', hook.lower()).strip('-')[:40]
         base = os.path.join(a.out, f'{n:02d}-{slug}')
         dur = t1 - t0
         finish = f"ass={base}.ass,fade=in:st=0:d=0.2,fade=out:st={dur - 0.3:.2f}:d=0.3"
         hv, cv = hook_margin, caption_margin
-        shots = stack_layout(video, t0, t1) if stack else None
+        turns = clip_turns(words[i0:j + 1], t0, t1) if labelled else None
+        shots = stack_layout(video, t0, t1, turns=turns, place=place) if stack else None
         if stack and shots is None:
             print('  not two people on screen for most of it: following the speaker instead')
         if shots:
@@ -619,7 +873,7 @@ def cut(a):
             # Each shot with its own look (a crop, two stacked, or fitted
             # where no face is seen), joined, then the captions over all.
             if not shots:
-                shots = speaker_shots(video, t0, t1, audio)
+                shots = turn_shots(video, t0, t1, turns, place=place) if turns else speaker_shots(video, t0, t1, audio)
                 if a.hook_margin is None and shots[0][2] is None:
                     hv = 470  # the first shot is a band: the hook above it
             parts = []
@@ -627,8 +881,13 @@ def cut(a):
                 head = f'[0:v]trim=start={sa:.3f}:end={sb:.3f},setpts=PTS-STARTPTS'
                 if crop and crop[0] == 'stack':
                     (tw, th, tx, ty), (bw, bh, bx, by) = crop[1], crop[2]
-                    parts.append(f'{head},split[t{k}][b{k}];[t{k}]crop={tw}:{th}:{tx}:{ty},scale=1080:960,setsar=1[t{k}c];'
-                                 f'[b{k}]crop={bw}:{bh}:{bx}:{by},scale=1080:960,setsar=1[b{k}c];'
+                    active = crop[3] if len(crop) > 3 else None
+                    # The one listening, a little dimmer, while the other speaks.
+                    dim = ',eq=brightness=-0.16:saturation=0.6'
+                    td = dim if active == 1 else ''
+                    bd = dim if active == 0 else ''
+                    parts.append(f'{head},split[t{k}][b{k}];[t{k}]crop={tw}:{th}:{tx}:{ty},scale=1080:960{td},setsar=1[t{k}c];'
+                                 f'[b{k}]crop={bw}:{bh}:{bx}:{by},scale=1080:960{bd},setsar=1[b{k}c];'
                                  f'[t{k}c][b{k}c]vstack=2,setsar=1[s{k}]')
                     continue
                 look = (f'crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]},scale=1080:1920' if crop
@@ -642,7 +901,13 @@ def cut(a):
                 for sa, sb, c in shots))
         else:
             video_args = ['-map', '0:v', '-map', '1:a', '-vf', f'{frame},{finish}']
-        open(base + '.ass', 'w').write(HEAD.format(cap_v=cv, hook_v=hv) + '\n'.join(ev) + '\n')
+        if names and turns:
+            # Who speaks, named in their colour, at the start of each turn.
+            for ta, tb, spk in turns:
+                if spk in names:
+                    ev.append(f'Dialogue: 2,{ts(ta)},{ts(min(tb, ta + 2.0))},Name,,0,0,0,,'
+                              f'{{\\c{speaker_colour(spk)}}}{esc(names[spk].upper())}')
+        open(base + '.ass', 'w').write(HEAD.format(cap_v=cv, hook_v=hv, name_v=cv + 95) + '\n'.join(ev) + '\n')
         run('ffmpeg', '-loglevel', 'error', '-y', '-ss', f'{t0:.2f}', '-i', video, '-ss', f'{t0:.2f}', '-i', audio,
             '-t', f'{dur:.2f}', *video_args,
             '-af', f'afade=in:st=0:d=0.15,afade=out:st={dur - 0.3:.2f}:d=0.3',
@@ -687,11 +952,21 @@ def main():
     s.add_argument('--threads', type=int, default=4, help='per piece (default 4)')
     s.add_argument('--jobs', type=int, default=0, help='pieces at once (default: cores / threads)')
     s.set_defaults(fn=transcribe)
+    s = sub.add_parser('diarize', help='who speaks when: a speaker for every word, after transcribe')
+    s.add_argument('dir')
+    s.add_argument('--speakers', type=int, default=0, help='how many people talk (default: counted from the voices)')
+    s.add_argument('--threshold', type=float, default=0.9,
+                   help='without --speakers: how unlike two voices must be to count as two people (lower: more people)')
+    s.add_argument('--threads', type=int, default=0)
+    s.set_defaults(fn=diarize)
     s = sub.add_parser('prompt'); s.add_argument('dir'); s.add_argument('-n', type=int, default=6)
     s.add_argument('--min', type=int, default=20); s.add_argument('--max', type=int, default=55); s.set_defaults(fn=prompt)
     s = sub.add_parser('cut'); s.add_argument('dir'); s.add_argument('clips'); s.add_argument('out')
     s.add_argument('--fix', action='append', default=[], metavar='HEARD=MEANT', help='fix a misheard word in the captions')
     s.add_argument('--keep-fillers', action='store_true', help='keep um and uh in the captions')
+    s.add_argument('--speakers', default='', metavar='A=NAME[@left|@right],…',
+                   help='after diarize: name the speakers (shown as they start to speak, captions in their colour); '
+                        '@left/@right says where they sit instead of matching voices to faces')
     s.add_argument('--frame', choices=['auto', 'fit', 'crop', 'speaker', 'stack'], default='auto',
                    help='a landscape video: fit it across the width over a blurred copy (auto, fit), crop 9:16 from its '
                         'middle (crop), follow whoever speaks (speaker), or two people one above the other '

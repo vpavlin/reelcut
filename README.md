@@ -9,6 +9,7 @@ picking the clips needs a model, and that can be any model, or a person.
 ```
 reelcut fetch URL DIR           # audio + video with yt-dlp
 reelcut transcribe DIR          # words.json, transcript-ts.txt, transcript.txt
+reelcut diarize DIR             # who speaks when: a speaker for every word
 reelcut prompt DIR              # what to ask a model to pick the clips
 reelcut cut DIR clips.txt OUT   # one 1080x1920 reel per clip
 reelcut page OUT                # an index.html that plays them
@@ -43,6 +44,22 @@ Containerfile has the exact commands. Point at them with `REELCUT_PARAKEET`
 and `REELCUT_MODEL` if they are not in `~/.local/bin` and
 `~/.local/share/whisper`.
 
+## Who speaks
+
+`reelcut diarize DIR` labels every word with its speaker (A, B, … in the
+order they first speak), and the transcripts then say who said each
+sentence (`[0:03:42] B: …`), so whoever picks the clips knows who said what.
+It runs pyannote's segmentation and NVIDIA's TitaNet speaker embeddings
+through sherpa-onnx on the CPU, at about 8× real time. Pass `--speakers N`
+when you know how many people talk; without it they are counted from the
+voices.
+
+Then `cut --speakers "A=Petty,B=Václav"` names them. Captions take each
+speaker's colour and a name shows as each turn begins. `--frame stack`
+dims whoever is listening, and `--frame speaker` cuts to whoever speaks.
+Voices are matched to faces by whose mouth moves while each one talks; if
+it gets that wrong, say where each sits: `A=Petty@left`.
+
 ## The clips file
 
 One clip per line, as `reelcut prompt` asks for:
@@ -62,6 +79,8 @@ the cut when two sentences share a stamp.
 - "um" and "uh" left out (`--keep-fillers` keeps them), but kept in the sound;
 - misheard words fixed with `--fix HEARD=MEANT`; check names against the
   video, because they are what the transcription gets wrong most;
+- in the speaker's colour after `diarize`, with their name as each turn
+  starts (`--speakers`);
 - a landscape video fitted across the width over a blurred copy of itself,
   so nothing is cut off, with the hook above the picture and the captions
   below it (`--frame crop` cuts 9:16 out of the middle instead);

@@ -15,11 +15,12 @@ FROM docker.io/library/debian:trixie-slim
 ARG MODEL=ggml-parakeet-tdt-0.6b-v3-q4_k.bin
 ARG MODEL_SHA256=8b205b8b39c6535e153de6fb11c51db46125d45c4f16ba496fe41a0fe71b885e
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-        ffmpeg python3 python3-numpy python3-pip fonts-dejavu-core libgomp1 ca-certificates curl unzip >/dev/null \
+        ffmpeg python3 python3-numpy python3-pip fonts-dejavu-core libgomp1 ca-certificates curl unzip bzip2 >/dev/null \
     && rm -rf /var/lib/apt/lists/*
 # OpenCV for --frame speaker: the headless wheel (~50 MB), not Debian's
 # python3-opencv, which brings a GUI and a video stack and adds 700 MB.
 RUN pip install --no-cache-dir --break-system-packages --no-deps opencv-python-headless==4.10.0.84 \
+    && pip install --no-cache-dir --break-system-packages sherpa-onnx==1.13.8 \
     && apt-get purge -y -qq python3-pip >/dev/null && apt-get autoremove -y -qq >/dev/null
 # yt-dlp moves with YouTube: the newest release at build time, and Deno, the
 # JavaScript runtime it now needs for YouTube.
@@ -33,8 +34,18 @@ RUN mkdir -p /models && curl -fsSL -o /models/$MODEL https://huggingface.co/ggml
 ARG FACE_SHA256=8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
 RUN curl -fsSL -o /models/yunet.onnx https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx \
     && echo "$FACE_SHA256  /models/yunet.onnx" | sha256sum -c --quiet
+# Diarization (reelcut diarize): pyannote segmentation 3.0 and TitaNet-small,
+# as sherpa-onnx's ONNX exports, checked.
+ARG SEG_SHA256=220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079
+ARG EMB_SHA256=ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e
+RUN curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 \
+        | tar xjO sherpa-onnx-pyannote-segmentation-3-0/model.onnx > /models/pyannote-segmentation-3.onnx \
+    && echo "$SEG_SHA256  /models/pyannote-segmentation-3.onnx" | sha256sum -c --quiet \
+    && curl -fsSL -o /models/titanet-small.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx \
+    && echo "$EMB_SHA256  /models/titanet-small.onnx" | sha256sum -c --quiet
 COPY --from=build /usr/local/bin/parakeet-cli /usr/local/bin/
 COPY reelcut /usr/local/bin/reelcut
-ENV REELCUT_MODEL=/models/$MODEL REELCUT_PARAKEET=/usr/local/bin/parakeet-cli REELCUT_FACE_MODEL=/models/yunet.onnx
+ENV REELCUT_MODEL=/models/$MODEL REELCUT_PARAKEET=/usr/local/bin/parakeet-cli REELCUT_FACE_MODEL=/models/yunet.onnx \
+    REELCUT_DIAR_SEG=/models/pyannote-segmentation-3.onnx REELCUT_DIAR_EMB=/models/titanet-small.onnx
 WORKDIR /work
 ENTRYPOINT ["reelcut"]

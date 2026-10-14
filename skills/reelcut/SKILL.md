@@ -28,6 +28,13 @@ alias reelcut='podman run --rm -v "$PWD":/work:z reelcut'   # paths below are th
 
    Speed: about 12× real time on a 20-core laptop. An 82-minute talk took
    7 minutes.
+   **Who speaks:** for an interview, podcast or meeting, run
+   `reelcut diarize DIR` (add `--speakers N` if you know how many people
+   talk). Every word gets a speaker, and `transcript-ts.txt` says who said
+   each sentence (`[0:03:42] B: …`). Read a few lines to learn who A and B
+   are, and use the names when cutting (`--speakers "A=Petty,B=Václav"`).
+   With the wrong speaker count, two people merge into one voice; check that
+   the talk times it prints look right.
 3. **Summarise or pick:** `reelcut prompt DIR` prints the instructions and
    the transcript, which can go to any model. To save your own quota, hand
    the transcript to a cheaper agent: put it where that agent can read it,
@@ -42,6 +49,17 @@ alias reelcut='podman run --rm -v "$PWD":/work:z reelcut'   # paths below are th
    which suits one person filling the middle of the frame. Each line it prints ends with the clip's last words: check them.
 5. **Page:** `reelcut page OUT --title "…"` writes an `index.html` that plays
    them all.
+
+## Framing a landscape recording
+
+- `auto`/`fit`: the whole frame over a blurred copy; safe for anything.
+- `stack`: two people one above the other, each cropped to their own tile;
+  the best look for interviews and calls. After `diarize`, the listener is
+  dimmed while the other speaks.
+- `speaker`: a crop that follows whoever speaks. Reliable only after
+  `diarize`; without it, it guesses from mouth movement and can sit on the
+  wrong person for a whole clip.
+- `crop`: 9:16 from the middle; only for one person in the centre.
 
 ## Picking: what makes a clip
 
