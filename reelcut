@@ -44,8 +44,20 @@ def fetch(a):
     # a portrait 1080x1920 counts as 1080), then plain https over HLS, whose
     # small fragments come throttled (a 97-minute video at 300 KB/s, and as
     # 360p, under the old filter), then H.264.
-    run('yt-dlp', '-q', '--no-warnings', '-f', 'bv*', '-S', 'res:1080,proto:https,vcodec:h264,ext:mp4',
-        '--remux-video', 'mp4', '-o', os.path.join(a.dir, 'video.%(ext)s'), a.url)
+    # A format YouTube lists can still answer 403 through the client yt-dlp
+    # picked (1080p, on scribe's box, 2026-10-14): another client, and only
+    # then less resolution.
+    for extra in ([], ['--extractor-args', 'youtube:player_client=web_safari,mweb'],
+                  ['-S', 'res:720,proto:https,vcodec:h264,ext:mp4']):
+        sort = extra if extra[:1] == ['-S'] else ['-S', 'res:1080,proto:https,vcodec:h264,ext:mp4'] + extra
+        for part in glob.glob(os.path.join(a.dir, 'video.*')):
+            os.remove(part)  # a half download of another format is not resumed
+        if subprocess.run(['yt-dlp', '-q', '--no-warnings', '-f', 'bv*', *sort, '--remux-video', 'mp4',
+                           '-o', os.path.join(a.dir, 'video.%(ext)s'), a.url]).returncode == 0:
+            break
+        print('reelcut: that video download failed; trying another way', file=sys.stderr)
+    else:
+        sys.exit('reelcut: no video could be downloaded')
     print(open(os.path.join(a.dir, 'meta.tsv')).read().strip())
 
 
@@ -223,13 +235,12 @@ def face_model():
     return p
 
 
-def speaker_shots(video, t0, t1, audio=None, fps=5.0, hold=1.5, lead=1.2, win=1.0):
-    """The shots of a clip: [(start, end, crop or None)], times from t0, a
-    crop (w, h, x, y) around whoever speaks, None where no face is seen (the
-    clip then shows that stretch fitted). The speaker is the face whose lower
-    half (mouth, jaw) moves most, held until another has clearly led for
-    `hold` seconds; each shot is a still crop, sized to the face and kept
-    inside the picture (a call's tile, not the black around it)."""
+def face_samples(video, t0, t1, fps=5.0):
+    """Faces between t0 and t1, about fps times a second: (samples, tracks,
+    W, H). A sample is (t, {track: (cx, activity, cy, face_h, face_w)},
+    frame or None); a track is one face followed across samples. Activity is
+    how much more the lower half of the face (mouth, jaw) changed than the
+    upper since the last sample."""
     import cv2
     import numpy as np
     cap = cv2.VideoCapture(video)
@@ -286,6 +297,51 @@ def speaker_shots(video, t0, t1, audio=None, fps=5.0, hold=1.5, lead=1.2, win=1.
             tr['prev'] = patch
             seen[best] = (cx, act, y + h / 2, h, w)
         samples.append((t, seen, frame if seen else None))
+    return samples, tracks, W, H
+
+
+def face_window(frame, W, H, cx, cy, fh, aspect, faces=3.2, least=0.5):
+    """A crop (w, h, x, y) of the given aspect (w/h) around a face: about
+    `faces` face heights tall but at least `least` of the frame, the face in
+    its upper third, and kept inside the picture around the face (a call's
+    tile, not the black around it), shrinking to fit it if need be."""
+    import cv2
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) > 18
+    cx, cy = min(max(0, int(cx)), W - 1), min(max(0, int(cy)), H - 1)
+    band = g[max(0, cy - 40):cy + 40, :].mean(axis=0) > 0.3
+    stack = g[:, max(0, cx - 40):cx + 40].mean(axis=1) > 0.3
+
+    def extent(m, at):
+        a = b = at
+        while a > 0 and m[a - 1]:
+            a -= 1
+        while b < len(m) - 1 and m[b + 1]:
+            b += 1
+        return a, b + 1
+    bx0, bx1 = extent(band, cx)
+    by0, by1 = extent(stack, cy)
+    # A tile in a call can be a tenth of the frame wide (scribe, 2026-10-14);
+    # under that, or on a dark frame, there is no picture box to keep to.
+    # A face against a black wall lights up only itself: a "box" barely
+    # bigger than the face is that, not a tile.
+    if bx1 - bx0 < W * 0.1 or by1 - by0 < H * 0.15 or by1 - by0 < 1.4 * fh or bx1 - bx0 < 1.6 * fh:
+        bx0, by0, bx1, by1 = 0, 0, W, H
+    ch = min(H, max(H * least, fh * faces), by1 - by0)
+    cw = ch * aspect
+    if cw > bx1 - bx0:
+        cw, ch = bx1 - bx0, (bx1 - bx0) / aspect
+    cw, ch = int(cw) // 2 * 2, int(ch) // 2 * 2
+    return cw, ch, int(min(max(bx0, cx - cw / 2), bx1 - cw)), int(min(max(by0, cy - ch / 3), by1 - ch))
+
+
+def speaker_shots(video, t0, t1, audio=None, fps=5.0, hold=1.0, lead=1.2, win=1.0):
+    """The shots of a clip: [(start, end, crop or None)], times from t0, a
+    crop (w, h, x, y) around whoever speaks, None where no face is seen (the
+    clip then shows that stretch fitted). The speaker is the face whose mouth
+    movement follows the loudness, held until another has clearly led for
+    `hold` seconds; each shot is a still crop (face_window)."""
+    import numpy as np
+    samples, tracks, W, H = face_samples(video, t0, t1, fps)
 
     # Each face against its own usual: a bright, noisy, textured picture
     # "moves" more than a dark one even while its person listens, so raw
@@ -347,27 +403,6 @@ def speaker_shots(video, t0, t1, audio=None, fps=5.0, hold=1.5, lead=1.2, win=1.
         who.append(cur)
 
     # Runs of the same face (or of none) are shots; a crop from the middle frame.
-    def window(frame, cx, cy, fh):
-        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) > 18
-        cx, cy = min(max(0, int(cx)), W - 1), min(max(0, int(cy)), H - 1)
-        band = g[max(0, cy - 40):cy + 40, :].mean(axis=0) > 0.3
-        stack = g[:, max(0, cx - 40):cx + 40].mean(axis=1) > 0.3
-        def extent(m, at):
-            a = b = at
-            while a > 0 and m[a - 1]: a -= 1
-            while b < len(m) - 1 and m[b + 1]: b += 1
-            return a, b + 1
-        bx0, bx1 = extent(band, cx)
-        by0, by1 = extent(stack, cy)
-        if bx1 - bx0 < W * 0.2 or by1 - by0 < H * 0.3:  # no picture box worth the name
-            bx0, by0, bx1, by1 = 0, 0, W, H
-        ch = min(H, max(H / 2, fh * 3.2), by1 - by0)
-        cw = ch * 9 / 16
-        if cw > bx1 - bx0:
-            cw, ch = bx1 - bx0, (bx1 - bx0) * 16 / 9
-        cw, ch = int(cw) // 2 * 2, int(ch) // 2 * 2
-        return cw, ch, int(min(max(bx0, cx - cw / 2), bx1 - cw)), int(min(max(by0, cy - ch / 3), by1 - ch))
-
     shots, k = [], 0
     while k < len(samples):
         j = k
@@ -383,7 +418,7 @@ def speaker_shots(video, t0, t1, audio=None, fps=5.0, hold=1.5, lead=1.2, win=1.
             cx = float(np.median([s[1][i][0] for s in run_]))
             cy = float(np.median([s[1][i][2] for s in run_]))
             fh = float(np.median([s[1][i][3] for s in run_]))
-            crop = window(mid[2], cx, cy, fh)
+            crop = face_window(mid[2], W, H, cx, cy, fh, 9 / 16)
         if shots and (b - a < 0.6 or shots[-1][2] == crop):
             shots[-1][1] = b  # too short to be a shot, or the same one again
         else:
@@ -392,6 +427,97 @@ def speaker_shots(video, t0, t1, audio=None, fps=5.0, hold=1.5, lead=1.2, win=1.
     if shots:
         shots[0][0], shots[-1][1] = 0.0, t1 - t0
     return shots or [[0.0, t1 - t0, None]]
+
+
+def stack_layout(video, t0, t1, fps=3.0):
+    """Two people, one above the other (--frame stack): the two faces seen
+    most in the clip, the one further left on top, each a 1080x960 crop
+    around them. None when the clip does not show two people for most of it.
+    No guessing who speaks: both are always on screen."""
+    import numpy as np
+    samples, tracks, W, H = face_samples(video, t0, t1, fps)
+    # A face whose track was lost and found again is one person: tracks whose
+    # positions agree are pooled.
+    people = []
+    for i in tracks:
+        seen = [s for s in samples if i in s[1]]
+        if not seen:
+            continue
+        cx = float(np.median([s[1][i][0] for s in seen]))
+        for p in people:
+            if abs(p['cx'] - cx) < W * 0.08:
+                p['seen'] += [(s, i) for s in seen]
+                break
+        else:
+            people.append({'cx': cx, 'seen': [(s, i) for s in seen]})
+    people.sort(key=lambda p: -len(p['seen']))
+    if len(people) < 2 or len(people[1]['seen']) < 0.3 * len(samples):
+        return None
+    pair = sorted(people[:2], key=lambda p: p['cx'])
+    crops = []
+    for p in pair:
+        seen = p['seen']
+        cy = float(np.median([s[1][i][2] for s, i in seen]))
+        fh = float(np.median([s[1][i][3] for s, i in seen]))
+        frame = seen[len(seen) // 2][0][2]
+        crops.append(face_window(frame, W, H, p['cx'], cy, fh, 1080 / 960, faces=2.0, least=0.2))
+    stacked = ('stack', crops[0], crops[1])
+    # Stacked where both are on screen; where the recording shows one person
+    # (a full-frame shot between call layouts), a crop around them; where
+    # nobody, fitted. Runs of the same, joined.
+    ids = [{i for s, i in p['seen']} for p in pair]
+    segs = []
+    for s in samples:
+        both = all(any(i in s[1] for i in ids_) for ids_ in ids)
+        if both:
+            look = stacked
+        elif s[1]:
+            i = max(s[1], key=lambda i: s[1][i][4])
+            look = ('one', i)
+        else:
+            look = None
+        a = s[0] - t0
+        if segs and segs[-1][2] == look:
+            segs[-1][1] = a
+        else:
+            segs.append([a, a, look])
+    out = []
+    for k, (a, b, look) in enumerate(segs):
+        b = segs[k + 1][0] if k + 1 < len(segs) else t1 - t0
+        if out and b - a < 0.6:
+            out[-1][1] = b  # too short to be a shot
+            continue
+        if look and look[0] == 'one':
+            i = look[1]
+            run_ = [s for s in samples if a <= s[0] - t0 <= b and i in s[1]]
+            mid = run_[len(run_) // 2]
+            look = face_window(mid[2], W, H, float(np.median([s[1][i][0] for s in run_])),
+                               float(np.median([s[1][i][2] for s in run_])),
+                               float(np.median([s[1][i][3] for s in run_])), 9 / 16)
+        if out and out[-1][2] == look:
+            out[-1][1] = b
+        else:
+            out.append([a, b, look])
+    out[0][0], out[-1][1] = 0.0, t1 - t0
+    return out
+
+
+_ENCODER = None
+
+
+def h264():
+    """x264 where ffmpeg has it; else OpenH264, which Fedora's ffmpeg-free
+    carries (scribe, 2026-10-14) at a fixed bitrate."""
+    global _ENCODER
+    if _ENCODER is None:
+        enc = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True).stdout
+        if ' libx264 ' in enc:
+            _ENCODER = ['-c:v', 'libx264', '-preset', 'medium', '-crf', '20']
+        elif ' libopenh264 ' in enc:
+            _ENCODER = ['-c:v', 'libopenh264', '-b:v', '6M']
+        else:
+            sys.exit('reelcut: ffmpeg here has no H.264 encoder (libx264 or libopenh264)')
+    return _ENCODER
 
 
 def cut(a):
@@ -408,7 +534,7 @@ def cut(a):
     # itself filling the frame ("fit"): nothing is cut off, a speaker or a
     # slide at the edge stays in. "crop" cuts 9:16 out of its middle instead.
     mode = a.frame if a.frame != 'auto' else ('fit' if w > h else 'crop')
-    if mode == 'speaker' and w <= h:
+    if mode in ('speaker', 'stack') and w <= h:
         mode = 'crop'  # a portrait recording is already framed
     if w <= h:
         frame = 'scale=1080:1920'
@@ -424,6 +550,7 @@ def cut(a):
     band = w > h and mode == 'fit'
     hook_margin = a.hook_margin if a.hook_margin is not None else (470 if band else 1190)
     speaker = w > h and mode == 'speaker'
+    stack = w > h and mode == 'stack'
 
     caption_margin = a.caption_margin if a.caption_margin is not None else 470
 
@@ -477,30 +604,49 @@ def cut(a):
         base = os.path.join(a.out, f'{n:02d}-{slug}')
         dur = t1 - t0
         finish = f"ass={base}.ass,fade=in:st=0:d=0.2,fade=out:st={dur - 0.3:.2f}:d=0.3"
-        hv = hook_margin
-        if speaker:
-            # Each shot with its own crop (or fitted, where no face is seen),
-            # joined, then the captions over the whole.
-            shots = speaker_shots(video, t0, t1, audio)
-            if a.hook_margin is None and shots[0][2] is None:
-                hv = 470  # the first shot is a band: the hook above it
+        hv, cv = hook_margin, caption_margin
+        shots = stack_layout(video, t0, t1) if stack else None
+        if stack and shots is None:
+            print('  not two people on screen for most of it: following the speaker instead')
+        if shots:
+            # Two people, one above the other: the text on the seam between
+            # them, the hook just above the captions, off both faces.
+            if a.hook_margin is None:
+                hv = 820
+            if a.caption_margin is None:
+                cv = 860
+        if speaker or stack:
+            # Each shot with its own look (a crop, two stacked, or fitted
+            # where no face is seen), joined, then the captions over all.
+            if not shots:
+                shots = speaker_shots(video, t0, t1, audio)
+                if a.hook_margin is None and shots[0][2] is None:
+                    hv = 470  # the first shot is a band: the hook above it
             parts = []
             for k, (sa, sb, crop) in enumerate(shots):
+                head = f'[0:v]trim=start={sa:.3f}:end={sb:.3f},setpts=PTS-STARTPTS'
+                if crop and crop[0] == 'stack':
+                    (tw, th, tx, ty), (bw, bh, bx, by) = crop[1], crop[2]
+                    parts.append(f'{head},split[t{k}][b{k}];[t{k}]crop={tw}:{th}:{tx}:{ty},scale=1080:960,setsar=1[t{k}c];'
+                                 f'[b{k}]crop={bw}:{bh}:{bx}:{by},scale=1080:960,setsar=1[b{k}c];'
+                                 f'[t{k}c][b{k}c]vstack=2,setsar=1[s{k}]')
+                    continue
                 look = (f'crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]},scale=1080:1920' if crop
                         else FIT.format(k=k))
-                parts.append(f'[0:v]trim=start={sa:.3f}:end={sb:.3f},setpts=PTS-STARTPTS,{look},setsar=1[s{k}]')
+                parts.append(f'{head},{look},setsar=1[s{k}]')
             graph = (';'.join(parts) + ';' + ''.join(f'[s{k}]' for k in range(len(shots))) +
                      f'concat=n={len(shots)}:v=1:a=0,{finish}[v]')
             video_args = ['-filter_complex', graph, '-map', '[v]', '-map', '1:a']
             print(f'  {len(shots)} shots: ' + ', '.join(
-                f"{sa:.1f}-{sb:.1f} {'fit' if c is None else str(c[0]) + 'x' + str(c[1])}" for sa, sb, c in shots))
+                f"{sa:.1f}-{sb:.1f} " + ('fit' if c is None else 'stacked' if c[0] == 'stack' else f'{c[0]}x{c[1]}')
+                for sa, sb, c in shots))
         else:
             video_args = ['-map', '0:v', '-map', '1:a', '-vf', f'{frame},{finish}']
-        open(base + '.ass', 'w').write(HEAD.format(cap_v=caption_margin, hook_v=hv) + '\n'.join(ev) + '\n')
+        open(base + '.ass', 'w').write(HEAD.format(cap_v=cv, hook_v=hv) + '\n'.join(ev) + '\n')
         run('ffmpeg', '-loglevel', 'error', '-y', '-ss', f'{t0:.2f}', '-i', video, '-ss', f'{t0:.2f}', '-i', audio,
             '-t', f'{dur:.2f}', *video_args,
             '-af', f'afade=in:st=0:d=0.15,afade=out:st={dur - 0.3:.2f}:d=0.3',
-            '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p',
+            *h264(), '-pix_fmt', 'yuv420p',
             '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', base + '.mp4')
         last = ' '.join(x[2] for x in words[max(i0, j - 3):j + 1])
         print(f'{base}.mp4  {dur:.1f}s  {ts(t0)} → {ts(t1)}  …{last}')
@@ -546,9 +692,10 @@ def main():
     s = sub.add_parser('cut'); s.add_argument('dir'); s.add_argument('clips'); s.add_argument('out')
     s.add_argument('--fix', action='append', default=[], metavar='HEARD=MEANT', help='fix a misheard word in the captions')
     s.add_argument('--keep-fillers', action='store_true', help='keep um and uh in the captions')
-    s.add_argument('--frame', choices=['auto', 'fit', 'crop', 'speaker'], default='auto',
+    s.add_argument('--frame', choices=['auto', 'fit', 'crop', 'speaker', 'stack'], default='auto',
                    help='a landscape video: fit it across the width over a blurred copy (auto, fit), crop 9:16 from its '
-                        'middle (crop), or follow whoever speaks (speaker, experimental: needs OpenCV)')
+                        'middle (crop), follow whoever speaks (speaker), or two people one above the other '
+                        '(stack); speaker and stack are experimental and need OpenCV')
     s.add_argument('--caption-margin', type=int, default=None, help='captions, px from the bottom of 1920 (default 470)')
     s.add_argument('--hook-margin', type=int, default=None, help='hook title, px from the top of 1920 (default: above a fitted picture, else 1190)')
     s.set_defaults(fn=cut)
