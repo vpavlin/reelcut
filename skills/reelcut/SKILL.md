@@ -36,8 +36,10 @@ alias reelcut='podman run --rm -v "$PWD":/work:z reelcut'   # paths below are th
 4. **Cut:** `reelcut cut DIR clips.txt OUT --fix Heard=Meant …` writes one
    `NN-hook.mp4` per clip. Each is 1080×1920 with captions four words at a
    time, the word being spoken in yellow, the hook title shown for 3.5 s,
-   and short fades. A landscape recording is cropped to 9:16 around its
-   middle. Each line it prints ends with the clip's last words: check them.
+   and short fades. A landscape recording is fitted across the width over
+   a blurred copy of itself (nothing cut off, hook above the picture,
+   captions below); `--frame crop` cuts 9:16 out of its middle instead,
+   which suits one person filling the middle of the frame. Each line it prints ends with the clip's last words: check them.
 5. **Page:** `reelcut page OUT --title "…"` writes an `index.html` that plays
    them all.
 

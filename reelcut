@@ -207,9 +207,25 @@ def cut(a):
     w, h = (int(x) for x in subprocess.check_output(
         ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height',
          '-of', 'csv=p=0:s=x', video], text=True).strip().split('x'))
-    # A landscape recording is cut to 9:16 around its middle; a portrait one is
-    # scaled to 1080x1920 as it is.
-    frame = 'scale=-2:1920,crop=1080:1920' if w > h else 'scale=1080:1920'
+    # A portrait recording is scaled to 1080x1920 as it is. A landscape one is,
+    # by default, fitted across the width over a blurred, darkened copy of
+    # itself filling the frame ("fit"): nothing is cut off, a speaker or a
+    # slide at the edge stays in. "crop" cuts 9:16 out of its middle instead.
+    mode = a.frame if a.frame != 'auto' else ('fit' if w > h else 'crop')
+    if w <= h:
+        frame = 'scale=1080:1920'
+    elif mode == 'fit':
+        frame = ('split[bg][fg];'
+                 '[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,'
+                 'gblur=sigma=40,eq=brightness=-0.12[bg];'
+                 '[fg]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2')
+    else:
+        frame = 'scale=-2:1920,crop=1080:1920'
+    # The hook above the picture when it is a band in the middle; over its
+    # lower part when it fills the frame.
+    band = w > h and mode == 'fit'
+    hook_margin = a.hook_margin if a.hook_margin is not None else (470 if band else 1190)
+    caption_margin = a.caption_margin if a.caption_margin is not None else 470
 
     def esc(s):
         for k, v in fixes.items():
@@ -259,7 +275,7 @@ def cut(a):
                 ev.append(f'Dialogue: 0,{ts(s)},{ts(max(e, s + 0.05))},Cap,,0,0,0,,{text}')
         slug = re.sub(r'[^a-z0-9]+', '-', hook.lower()).strip('-')[:40]
         base = os.path.join(a.out, f'{n:02d}-{slug}')
-        open(base + '.ass', 'w').write(HEAD.format(cap_v=a.caption_margin, hook_v=a.hook_margin) + '\n'.join(ev) + '\n')
+        open(base + '.ass', 'w').write(HEAD.format(cap_v=caption_margin, hook_v=hook_margin) + '\n'.join(ev) + '\n')
         dur = t1 - t0
         run('ffmpeg', '-loglevel', 'error', '-y', '-ss', f'{t0:.2f}', '-i', video, '-ss', f'{t0:.2f}', '-i', audio,
             '-t', f'{dur:.2f}', '-map', '0:v', '-map', '1:a',
@@ -311,8 +327,10 @@ def main():
     s = sub.add_parser('cut'); s.add_argument('dir'); s.add_argument('clips'); s.add_argument('out')
     s.add_argument('--fix', action='append', default=[], metavar='HEARD=MEANT', help='fix a misheard word in the captions')
     s.add_argument('--keep-fillers', action='store_true', help='keep um and uh in the captions')
-    s.add_argument('--caption-margin', type=int, default=470, help='captions, px from the bottom of 1920')
-    s.add_argument('--hook-margin', type=int, default=1190, help='hook title, px from the top of 1920')
+    s.add_argument('--frame', choices=['auto', 'fit', 'crop'], default='auto',
+                   help='a landscape video: fit it across the width over a blurred copy (auto, fit) or crop 9:16 from its middle')
+    s.add_argument('--caption-margin', type=int, default=None, help='captions, px from the bottom of 1920 (default 470)')
+    s.add_argument('--hook-margin', type=int, default=None, help='hook title, px from the top of 1920 (default: above a fitted picture, else 1190)')
     s.set_defaults(fn=cut)
     s = sub.add_parser('page'); s.add_argument('out'); s.add_argument('--title', default='Reels'); s.set_defaults(fn=page)
     a = ap.parse_args()

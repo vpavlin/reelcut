@@ -62,8 +62,11 @@ the cut when two sentences share a stamp.
 - "um" and "uh" left out (`--keep-fillers` keeps them), but kept in the sound;
 - misheard words fixed with `--fix HEARD=MEANT`; check names against the
   video, because they are what the transcription gets wrong most;
-- placed for a portrait layout. Move them with `--caption-margin` and
-  `--hook-margin`. A landscape video is cropped to 9:16 around its middle.
+- a landscape video fitted across the width over a blurred copy of itself,
+  so nothing is cut off, with the hook above the picture and the captions
+  below it (`--frame crop` cuts 9:16 out of the middle instead);
+- placed for that layout; move them with `--caption-margin` and
+  `--hook-margin` if they sit on something.
 
 ## For agents
 
