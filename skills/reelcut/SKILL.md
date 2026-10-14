@@ -10,7 +10,7 @@ The tool is `reelcut` (a single Python script), or the container image
 `reelcut`, which carries yt-dlp, ffmpeg, Parakeet and its model:
 
 ```
-alias reelcut='podman run --rm -v "$PWD":/work:Z reelcut'   # paths below are then under /work
+alias reelcut='podman run --rm -v "$PWD":/work:z reelcut'   # paths below are then under /work
 ```
 
 ## Steps
@@ -77,6 +77,11 @@ alias reelcut='podman run --rm -v "$PWD":/work:Z reelcut'   # paths below are th
   formats come in throttled fragments, about 300 KB/s.
 - yt-dlp falls behind YouTube; an HTTP 403 on everything usually means
   `yt-dlp -U`, or rebuilding the image.
+- Mount with `:z` (lower case), never `:Z`, on an SELinux machine. `:Z`
+  gives the folder a label private to one container, so a second container
+  on the same folder (a fetch beside a transcribe, a `prompt` call) takes it
+  away from the first, which then fails mid-write with a bare
+  `PermissionError` (scribe, 2026-10-13). `:z` shares the label.
 - Initials ("H. L.") are not sentence ends. `reelcut` knows this, so don't
   count sentences by `.` yourself.
 

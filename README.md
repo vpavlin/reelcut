@@ -23,7 +23,7 @@ The image carries yt-dlp, ffmpeg, `parakeet-cli` and the model (about 1 GB),
 for amd64 and arm64:
 
 ```
-alias reelcut='podman run --rm -v "$PWD":/work:Z ghcr.io/vpavlin/reelcut'
+alias reelcut='podman run --rm -v "$PWD":/work:z ghcr.io/vpavlin/reelcut'
 reelcut fetch 'https://www.youtube.com/watch?v=…' /work/talk
 reelcut transcribe /work/talk
 reelcut prompt /work/talk > talk/prompt.txt     # give this to a model
