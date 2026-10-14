@@ -25,6 +25,15 @@ def run(*a, **kw):
     return subprocess.run(a, check=True, **kw)
 
 
+def write_json(path, data):
+    """Written whole or not at all: transcribe and diarize can run side by
+    side, and each may read what the other just wrote."""
+    tmp = path + '.part'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
 def find(d, pattern):
     hits = sorted(glob.glob(os.path.join(d, pattern)))
     if not hits:
@@ -88,9 +97,11 @@ def transcribe(a):
             print(f'\r{i}/{len(wavs)}', end='', file=sys.stderr)
     print(file=sys.stderr)
     words = parse_words(p)
-    json.dump([[round(s, 2), round(e, 2), w] for s, e, w in words], open(os.path.join(d, 'words.json'), 'w'))
+    write_json(os.path.join(d, 'words.json'), [[round(s, 2), round(e, 2), w] for s, e, w in words])
     n = write_transcripts(d, words)
     print(f'{len(words)} words, {n} sentences: {d}/transcript-ts.txt')
+    if os.path.exists(os.path.join(d, 'diarization.json')):
+        label_words(d)  # diarize finished first: the words get their speakers now
 
 
 def write_transcripts(d, words):
@@ -220,13 +231,14 @@ def diarize(a):
     import numpy as np
     import sherpa_onnx
     d = a.dir
-    words = json.load(open(os.path.join(d, 'words.json')))
     src = find(d, 'audio.*') if glob.glob(os.path.join(d, 'audio.*')) else find(d, 'video.*')
     pcm = subprocess.run(['ffmpeg', '-loglevel', 'error', '-i', src, '-vn', '-ac', '1', '-ar', '16000',
                           '-f', 's16le', '-'], capture_output=True, check=True).stdout
     audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768
     seg, emb = diar_models()
-    threads = a.threads or min(os.cpu_count() or 4, 8)
+    # Four threads: as fast as eight or sixteen here (sherpa scales no
+    # further; sixteen was slower), and the rest is left to transcribe.
+    threads = a.threads or 4
     cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
         segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
             pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=seg), num_threads=threads),
@@ -258,15 +270,8 @@ def diarize(a):
     order = {}
     for _, _, sp in segs:
         order.setdefault(sp, chr(65 + len(order)))
-    out = []
-    for w in words:
-        mid = (w[0] + w[1]) / 2
-        hit = [sp for s0, s1, sp in segs if s0 <= mid <= s1]
-        if not hit:  # between turns: the nearest
-            hit = [min(segs, key=lambda x: min(abs(x[0] - mid), abs(x[1] - mid)))[2]]
-        out.append([w[0], w[1], w[2], order[hit[0]]])
-    json.dump(out, open(os.path.join(d, 'words.json'), 'w'))
-    write_transcripts(d, out)
+    write_json(os.path.join(d, 'diarization.json'),
+               [[round(s0, 2), round(s1, 2), order[sp]] for s0, s1, sp in segs])
     dur = len(audio) / 16000
     talk = {}
     for s0, s1, sp in segs:
@@ -274,7 +279,28 @@ def diarize(a):
     print(f'{len(order)} speakers in {dur:.0f} s of audio, told apart in {took:.0f} s '
           f'({dur / max(took, 0.1):.0f}x real time): ' +
           ', '.join(f'{k} {v / 60:.1f} min' for k, v in sorted(talk.items())))
-    print(f'{d}/transcript-ts.txt now says who said each sentence ("[0:03:42] B: …")')
+    if os.path.exists(os.path.join(d, 'words.json')):
+        label_words(d)
+        print(f'{d}/transcript-ts.txt now says who said each sentence ("[0:03:42] B: …")')
+    else:
+        print(f'saved in {d}/diarization.json; transcribe labels the words when it finishes')
+
+
+def label_words(d):
+    """Each word of words.json given the speaker of diarization.json whose
+    turn it falls in (the nearest turn between them), and the transcripts
+    written again with who said each sentence."""
+    segs = json.load(open(os.path.join(d, 'diarization.json')))
+    words = json.load(open(os.path.join(d, 'words.json')))
+    out = []
+    for w in words:
+        mid = (w[0] + w[1]) / 2
+        hit = [sp for s0, s1, sp in segs if s0 <= mid <= s1]
+        if not hit:
+            hit = [min(segs, key=lambda x: min(abs(x[0] - mid), abs(x[1] - mid)))[2]]
+        out.append([w[0], w[1], w[2], hit[0]])
+    write_json(os.path.join(d, 'words.json'), out)
+    write_transcripts(d, out)
 
 
 # --- prompt ------------------------------------------------------------------
@@ -1019,7 +1045,7 @@ def main():
     s.add_argument('--threads', type=int, default=4, help='per piece (default 4)')
     s.add_argument('--jobs', type=int, default=0, help='pieces at once (default: cores / threads)')
     s.set_defaults(fn=transcribe)
-    s = sub.add_parser('diarize', help='who speaks when: a speaker for every word, after transcribe')
+    s = sub.add_parser('diarize', help='who speaks when: a speaker for every word; before, after or alongside transcribe')
     s.add_argument('dir')
     s.add_argument('--speakers', type=int, default=0, help='how many people talk (default: counted from the voices)')
     s.add_argument('--threshold', type=float, default=0.9,
