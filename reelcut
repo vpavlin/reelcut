@@ -642,8 +642,9 @@ def clip_turns(words, t0, t1, least=1.0):
             out[-1][1] = r[1]
         else:
             out.append(r)
-    # A sliver of another voice at the very start is not a turn either.
-    if len(out) > 1 and out[0][1] - out[0][0] < least:
+    # A sliver of another voice at the very start is not a turn either; a
+    # little more lenient than mid-clip (scribe's clip 2 opened on exactly 1 s).
+    if len(out) > 1 and out[0][1] - out[0][0] < least * 1.5:
         out[1][0] = 0.0
         out.pop(0)
     return out
@@ -918,7 +919,11 @@ def cut(a):
         finish = f"ass={base}.ass,fade=in:st=0:d=0.2,fade=out:st={dur - 0.3:.2f}:d=0.3"
         hv, cv = hook_margin, caption_margin
         turns = clip_turns(words[i0:j + 1], t0, t1) if labelled else None
-        if turns and (stack or speaker) and not (places and learnt[0] <= t0 and t1 <= learnt[1]):
+        # Where each voice sits: as the person said (@left/@right), which is
+        # certain and free; else matched from the stretch around the clip,
+        # which is slower and can be wrong when faces are dark or small.
+        told = turns and all(t[2] in place for t in turns)
+        if turns and (stack or speaker) and not told and not (places and learnt[0] <= t0 and t1 <= learnt[1]):
             places, learnt = speaker_places(video, words, t0, t1)
         shots = stack_layout(video, t0, t1, turns=turns, place=place, places=places) if stack else None
         if stack and shots is None:
