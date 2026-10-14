@@ -43,30 +43,48 @@ def find(d, pattern):
 
 # --- fetch -------------------------------------------------------------------
 
+def download(a, name, ways, extra=()):
+    """One download, tried several ways: YouTube answers some requests with
+    a 403 depending on the client yt-dlp poses as and the format (audio
+    and video alike, intermittently), so another client, then a plainer
+    format. A half download of one way is not resumed by the next. Fails
+    with yt-dlp's own reason, not a bare exit status."""
+    tried = []
+    for args in ways:
+        for part in glob.glob(os.path.join(a.dir, name + '.*')):
+            os.remove(part)
+        r = subprocess.run(['yt-dlp', '--no-warnings', '--no-progress', *args, *extra,
+                            '-o', os.path.join(a.dir, name + '.%(ext)s'), a.url],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if r.returncode == 0:
+            return
+        lines = r.stderr.strip().splitlines()
+        why = ([l for l in lines if l.startswith('ERROR')] or lines[-1:] or [f'exit {r.returncode}'])[-1]
+        tried.append(why)
+        print(f'reelcut: the {name} download failed ({why}); trying another way', file=sys.stderr)
+    sys.exit(f'reelcut: no {name} could be downloaded. ' + ' | '.join(tried))
+
+
+OTHER_CLIENTS = ['--extractor-args', 'youtube:player_client=web_safari,mweb']
+
+
 def fetch(a):
     os.makedirs(a.dir, exist_ok=True)
-    out = lambda name: os.path.join(a.dir, name + '.%(ext)s')
-    run('yt-dlp', '-q', '--no-warnings', '-f', 'bestaudio', '-o', out('audio'),
-        '--print-to-file', '%(title)s\t%(channel)s\t%(duration)s\t%(upload_date)s',
-        os.path.join(a.dir, 'meta.tsv'), a.url)
+    meta = ['--print-to-file', '%(title)s\t%(channel)s\t%(duration)s\t%(upload_date)s',
+            os.path.join(a.dir, 'meta.tsv')]
+    # The audio first: transcription can start on it while the video comes.
+    # A plainer format last: "251-20" and the like are variants of a track,
+    # which a 403 can hit where the plain one is fine.
+    download(a, 'audio', [['-f', 'bestaudio'], ['-f', 'bestaudio', *OTHER_CLIENTS],
+                          ['-f', 'bestaudio[format_id!*=-]/bestaudio', *OTHER_CLIENTS]], meta)
     # Ranked, not filtered: up to 1080p by the shorter side (yt-dlp's res, so
     # a portrait 1080x1920 counts as 1080), then plain https over HLS, whose
     # small fragments come throttled (a 97-minute video at 300 KB/s, and as
-    # 360p, under the old filter), then H.264.
-    # A format YouTube lists can still answer 403 through the client yt-dlp
-    # picked (1080p, on scribe's box, 2026-10-14): another client, and only
-    # then less resolution.
-    for extra in ([], ['--extractor-args', 'youtube:player_client=web_safari,mweb'],
-                  ['-S', 'res:720,proto:https,vcodec:h264,ext:mp4']):
-        sort = extra if extra[:1] == ['-S'] else ['-S', 'res:1080,proto:https,vcodec:h264,ext:mp4'] + extra
-        for part in glob.glob(os.path.join(a.dir, 'video.*')):
-            os.remove(part)  # a half download of another format is not resumed
-        if subprocess.run(['yt-dlp', '-q', '--no-warnings', '-f', 'bv*', *sort, '--remux-video', 'mp4',
-                           '-o', os.path.join(a.dir, 'video.%(ext)s'), a.url]).returncode == 0:
-            break
-        print('reelcut: that video download failed; trying another way', file=sys.stderr)
-    else:
-        sys.exit('reelcut: no video could be downloaded')
+    # 360p, under the old filter), then H.264. Then another client, then
+    # 720p (1080p answered 403 on scribe's box, 2026-10-14).
+    best = ['-f', 'bv*', '-S', 'res:1080,proto:https,vcodec:h264,ext:mp4']
+    download(a, 'video', [best, best + OTHER_CLIENTS, ['-f', 'bv*', '-S', 'res:720,proto:https,vcodec:h264,ext:mp4']],
+             ['--remux-video', 'mp4'])
     print(open(os.path.join(a.dir, 'meta.tsv')).read().strip())
 
 
