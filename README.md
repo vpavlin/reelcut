@@ -58,7 +58,9 @@ Then `cut --speakers "A=Petty,B=Václav"` names them. Captions take each
 speaker's colour and a name shows as each turn begins. `--frame stack`
 dims whoever is listening, and `--frame speaker` cuts to whoever speaks.
 Voices are matched to faces by whose mouth moves while each one talks; if
-it gets that wrong, say where each sits: `A=Petty@left`.
+it gets that wrong, say where each sits: `A=Petty@left`, `@middle` or
+`@right`. With three or more on screen, `--frame stack` shows the two who
+talk most in each clip.
 
 ## Choosing and styling
 
@@ -96,8 +98,11 @@ the cut when two sentences share a stamp.
 - a landscape video fitted across the width over a blurred copy of itself,
   so nothing is cut off, with the hook above the picture and the captions
   below it (`--frame crop` cuts 9:16 out of the middle instead);
-- placed for that layout; move them with `--caption-margin` and
-  `--hook-margin` if they sit on something.
+- placed for that layout; move them with `--caption-margin` (pixels from
+  the bottom of 1920) and `--hook-margin` if they sit on something;
+- white (or the speaker's colour) with the word being said in yellow;
+  choose your own with `--colour`, `--saying-colour` and `--said-colour`
+  (the words already said), each as `#RRGGBB`.
 
 ## For agents
 

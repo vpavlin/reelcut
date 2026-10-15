@@ -368,6 +368,36 @@ def speaker_colour(letter):
     return SPEAKER_COLOURS[(ord(letter) - 65) % len(SPEAKER_COLOURS)] if letter else SPEAKER_COLOURS[0]
 
 
+def ass_colour(hexrgb):
+    """'#FFAA00' (or 'ffaa00') as ASS writes it: '&H00AAFF&'; '' stays ''."""
+    h = (hexrgb or '').strip().lstrip('#')
+    if not h:
+        return ''
+    if not re.fullmatch(r'[0-9A-Fa-f]{6}', h):
+        sys.exit(f'reelcut: {hexrgb!r} is not a colour; write it as #RRGGBB')
+    return f'&H{h[4:6]}{h[2:4]}{h[0:2]}&'.upper()
+
+
+# Where a person sits, as --speakers takes it ("A=Name@middle").
+SIDES = {'left': 'left', 'right': 'right', 'middle': 'middle', 'center': 'middle', 'centre': 'middle'}
+
+
+def side_person(people, side, W):
+    """The person sitting on that side (left, middle, right), as an index in
+    people; faces seen only now and then (a passer-by, a picture) left out."""
+    if not people:
+        return None
+    most = len(people[0]['seen'])
+    cand = [k for k in range(len(people)) if len(people[k]['seen']) >= 0.15 * most]
+    by_x = sorted(cand, key=lambda k: people[k]['cx'])
+    if side == 'left':
+        return by_x[0]
+    if side == 'right':
+        return by_x[-1]
+    inner = by_x[1:-1] or by_x
+    return min(inner, key=lambda k: abs(people[k]['cx'] - W / 2))
+
+
 HEAD = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -529,10 +559,10 @@ def turn_shots(video, t0, t1, turns, fps=5.0, place=None, places=None):
     samples, tracks, W, H = face_samples(video, t0, t1, fps)
     people = pool_people(samples, tracks, W)
     who = placed(people, places, W) if places else voice_faces(samples, people, turns, t0)
-    by_x = sorted(range(len(people)), key=lambda k: people[k]['cx'])
     for spk, side in (place or {}).items():
-        if by_x:
-            who[spk] = by_x[0] if side == 'left' else by_x[-1]
+        k = side_person(people, side, W)
+        if k is not None:
+            who[spk] = k
     shots = []
     for a, b, spk in turns:
         run_ = [s for s in samples if a <= s[0] - t0 < b and s[1]]
@@ -788,6 +818,22 @@ def stack_layout(video, t0, t1, fps=3.0, turns=None, place=None, places=None):
     if len(people) < 2 or len(people[1]['seen']) < 0.3 * len(samples):
         return None
     pair = sorted(people[:2], key=lambda p: p['cx'])
+    if place and turns and len(people) > 2:
+        # Three or more on screen: the two who talk most in this clip, where
+        # the person said they sit (left, middle, right).
+        talk = {}
+        for a, b, spk in turns:
+            talk[spk] = talk.get(spk, 0) + b - a
+        chosen = []
+        for spk in sorted(talk, key=lambda k: -talk[k]):
+            k = side_person(people, place[spk], W) if spk in place else None
+            if k is not None and k not in chosen:
+                chosen.append(k)
+        for k in range(len(people)):
+            if len(chosen) < 2 and k not in chosen:
+                chosen.append(k)
+        if all(len(people[k]['seen']) >= 0.3 * len(samples) for k in chosen[:2]):
+            pair = sorted((people[k] for k in chosen[:2]), key=lambda p: p['cx'])
     crops = []
     for p in pair:
         seen = p['seen']
@@ -842,7 +888,12 @@ def stack_layout(video, t0, t1, fps=3.0, turns=None, place=None, places=None):
     # length of each turn.
     who = placed(pair, places, W) if places else voice_faces(samples, pair, turns, t0)
     for spk, side in (place or {}).items():
-        who[spk] = 0 if side == 'left' else 1
+        k = side_person(people, side, W)
+        on = [n for n, p in enumerate(pair) if k is not None and p is people[k]]
+        if on:
+            who[spk] = on[0]
+        else:
+            who.pop(spk, None)  # not one of the two shown: neither half is theirs
     split = []
     for a, b, look in out:
         if not (look and look[0] == 'stack'):
@@ -914,8 +965,8 @@ def cut(a):
         letter, _, rest = item.partition('=')
         name, _, side = rest.partition('@')
         names[letter.strip().upper()] = name.strip()
-        if side.strip() in ('left', 'right'):
-            place[letter.strip().upper()] = side.strip()
+        if side.strip().lower() in SIDES:
+            place[letter.strip().upper()] = SIDES[side.strip().lower()]
     labelled = any(len(x) > 3 for x in words)
     places, learnt = None, (0, 0)  # where each voice sits, and the stretch that says so
 
@@ -924,6 +975,18 @@ def cut(a):
             s = re.sub(r'\b' + re.escape(k) + r'\b', v, s)
         s = re.sub(r'([A-Za-z])(\d)', r'\1 \2', s)  # "like60" -> "like 60"
         return s.replace('\\', '').replace('{', '(').replace('}', ')')
+
+    # The captions' colours (--colour, --saying-colour, --said-colour): the
+    # words to come in the speaker's colour unless one is given, the word
+    # being said yellow, the words said as the ones to come unless given.
+    to_come, saying, said = ass_colour(a.colour), ass_colour(a.saying_colour) or SAYING, ass_colour(a.said_colour)
+
+    def word_colour(y, yi, wi):
+        if yi == wi:
+            return saying
+        if yi < wi and said:
+            return said
+        return to_come or speaker_colour(y[3] if len(y) > 3 else None)
 
     only = {int(x) for x in a.only.split(',') if x.strip()} if a.only else None
     for n, parts in enumerate(clip_lines(a.clips), 1):
@@ -968,8 +1031,7 @@ def cut(a):
             for wi, x in enumerate(g):
                 s = x[0] - t0
                 e = (g[wi + 1][0] if wi + 1 < len(g) else g_end) - t0
-                text = ' '.join('{\\c' + (SAYING if y is x else speaker_colour(y[3] if len(y) > 3 else None)) + '}'
-                                + esc(y[2]) for y in g)
+                text = ' '.join('{\\c' + word_colour(y, yi, wi) + '}' + esc(y[2]) for yi, y in enumerate(g))
                 ev.append(f'Dialogue: 0,{ts(s)},{ts(max(e, s + 0.05))},Cap,,0,0,0,,{text}')
         slug = re.sub(r'[^a-z0-9]+', '-', hook.lower()).strip('-')[:40]
         base = os.path.join(a.out, f'{n:02d}-{slug}')
@@ -1034,7 +1096,7 @@ def cut(a):
                 if spk in names and tb - ta > 0.8:
                     ev.append(f'Dialogue: 2,{ts(ta)},{ts(min(tb, ta + 2.0))},Name,,0,0,0,,'
                               f'{{\\c{speaker_colour(spk)}}}{esc(names[spk].upper())}')
-        open(base + '.ass', 'w').write(HEAD.format(cap_v=cv, hook_v=hv, name_v=cv + 95) + '\n'.join(ev) + '\n')
+        open(base + '.ass', 'w').write(HEAD.format(cap_v=cv, hook_v=hv, name_v=min(cv + 95, 1800)) + '\n'.join(ev) + '\n')
         run('ffmpeg', '-loglevel', 'error', '-y', '-ss', f'{t0:.2f}', '-i', video, '-ss', f'{t0:.2f}', '-i', audio,
             '-t', f'{dur:.2f}', *video_args,
             '-af', f'afade=in:st=0:d={fd:.2f},afade=out:st={dur - fd:.2f}:d={fd:.2f}',
@@ -1137,13 +1199,19 @@ def main():
     s.add_argument('--card', type=float, default=2.0, help='seconds each card shows (default 2)')
     s.add_argument('--fix', action='append', default=[], metavar='HEARD=MEANT', help='fix a misheard word in the captions')
     s.add_argument('--keep-fillers', action='store_true', help='keep um and uh in the captions')
-    s.add_argument('--speakers', default='', metavar='A=NAME[@left|@right],…',
+    s.add_argument('--speakers', default='', metavar='A=NAME[@left|@middle|@right],…',
                    help='after diarize: name the speakers (shown as they start to speak, captions in their colour); '
-                        '@left/@right says where they sit instead of matching voices to faces')
+                        '@left/@middle/@right says where they sit instead of matching voices to faces')
     s.add_argument('--frame', choices=['auto', 'fit', 'crop', 'speaker', 'stack'], default='auto',
                    help='a landscape video: fit it across the width over a blurred copy (auto, fit), crop 9:16 from its '
                         'middle (crop), follow whoever speaks (speaker), or two people one above the other '
                         '(stack); speaker and stack are experimental and need OpenCV')
+    s.add_argument('--colour', '--color', default='', metavar='#RRGGBB',
+                   help="the captions' words still to be said (default: the speaker's colour, white)")
+    s.add_argument('--saying-colour', '--saying-color', default='', metavar='#RRGGBB',
+                   help='the word being said (default #FFE500, yellow)')
+    s.add_argument('--said-colour', '--said-color', default='', metavar='#RRGGBB',
+                   help='the words already said (default: as the ones still to be said)')
     s.add_argument('--caption-margin', type=int, default=None, help='captions, px from the bottom of 1920 (default 470)')
     s.add_argument('--hook-margin', type=int, default=None, help='hook title, px from the top of 1920 (default: above a fitted picture, else 1190)')
     s.set_defaults(fn=cut)
