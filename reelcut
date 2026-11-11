@@ -4,6 +4,7 @@
   reelcut fetch URL DIR             the audio and the video, with yt-dlp
   reelcut transcribe DIR            word-level transcript, with Parakeet
   reelcut prompt DIR                what to ask a model to pick the clips
+  reelcut scenes DIR CLIPS OUT      each clip's scenes and a frame of each, to frame by hand
   reelcut cut DIR CLIPS OUT         the reels, from a list of clips
   reelcut page OUT [--title T]      an index.html that plays them
 
@@ -19,6 +20,15 @@ PARAKEET = os.environ.get('REELCUT_PARAKEET', shutil.which('parakeet-cli') or os
 PIECE = 60  # seconds per transcription piece
 
 FILLERS = {'um', 'umm', 'uh', 'uhh', 'uhm', 'er', 'erm', 'hmm', 'mm'}
+
+# The reel's shape (--ratio, or a clip's framing): width x height in pixels.
+RATIOS = {'9:16': (1080, 1920), '4:5': (1080, 1350), '1:1': (1080, 1080)}
+OW, OH = RATIOS['9:16']
+
+
+def canvas(ratio):
+    global OW, OH
+    OW, OH = RATIOS.get(ratio or '9:16', RATIOS['9:16'])
 
 
 def run(*a, **kw):
@@ -400,8 +410,8 @@ def side_person(people, side, W):
 
 HEAD = """[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: {ow}
+PlayResY: {oh}
 WrapStyle: 0
 
 [V4+ Styles]
@@ -431,10 +441,14 @@ def clip_lines(path):
 FACE_MODEL_URL = ('https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/'
                   'face_detection_yunet/face_detection_yunet_2023mar.onnx')
 FACE_MODEL_SHA256 = '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4'
-FIT = ('split[bg{k}][fg{k}];'
-       '[bg{k}]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,'
-       'gblur=sigma=40,eq=brightness=-0.12[bg{k}b];'
-       '[fg{k}]scale=1080:-2[fg{k}b];[bg{k}b][fg{k}b]overlay=(W-w)/2:(H-h)/2')
+def fit(k=''):
+    """The whole picture across the reel's width, over a blurred, darkened
+    copy of itself filling the reel."""
+    return (f'split[bg{k}][fg{k}];'
+            f'[bg{k}]scale={OW}:{OH}:force_original_aspect_ratio=increase,crop={OW}:{OH},'
+            f'gblur=sigma=40,eq=brightness=-0.12[bg{k}b];'
+            f'[fg{k}]scale={OW}:{OH}:force_original_aspect_ratio=decrease,setsar=1[fg{k}b];'
+            f'[bg{k}b][fg{k}b]overlay=(W-w)/2:(H-h)/2')
 
 
 def face_model():
@@ -576,7 +590,7 @@ def turn_shots(video, t0, t1, turns, fps=5.0, place=None, places=None):
             mid = mine[len(mine) // 2]
             crop = face_window(mid[0][2], W, H, float(np.median([s[1][i][0] for s, i in mine])),
                                float(np.median([s[1][i][2] for s, i in mine])),
-                               float(np.median([s[1][i][3] for s, i in mine])), 9 / 16)
+                               float(np.median([s[1][i][3] for s, i in mine])), OW / OH)
         if shots and shots[-1][2] == crop:
             shots[-1][1] = b
         else:
@@ -668,7 +682,7 @@ def speaker_shots(video, t0, t1, audio=None, fps=5.0, hold=1.0, lead=1.2, win=1.
             cx = float(np.median([s[1][i][0] for s in run_]))
             cy = float(np.median([s[1][i][2] for s in run_]))
             fh = float(np.median([s[1][i][3] for s in run_]))
-            crop = face_window(mid[2], W, H, cx, cy, fh, 9 / 16)
+            crop = face_window(mid[2], W, H, cx, cy, fh, OW / OH)
         if shots and (b - a < 0.6 or shots[-1][2] == crop):
             shots[-1][1] = b  # too short to be a shot, or the same one again
         else:
@@ -842,7 +856,7 @@ def stack_layout(video, t0, t1, fps=3.0, turns=None, place=None, places=None):
         frame = seen[len(seen) // 2][0][2]
         # Head and shoulders with room above: a small call tile zoomed to
         # two face heights filled the half with a head and cut its top.
-        crops.append(face_window(frame, W, H, p['cx'], cy, fh, 1080 / 960, faces=2.8, least=0.3, eyes=0.42))
+        crops.append(face_window(frame, W, H, p['cx'], cy, fh, OW / (OH // 2), faces=2.8, least=0.3, eyes=0.42))
     stacked = ('stack', crops[0], crops[1])
     # Stacked where both are on screen; where the recording shows one person
     # (a full-frame shot between call layouts), a crop around them; where
@@ -875,7 +889,7 @@ def stack_layout(video, t0, t1, fps=3.0, turns=None, place=None, places=None):
             mid = run_[len(run_) // 2]
             look = face_window(mid[2], W, H, float(np.median([s[1][i][0] for s in run_])),
                                float(np.median([s[1][i][2] for s in run_])),
-                               float(np.median([s[1][i][3] for s in run_])), 9 / 16)
+                               float(np.median([s[1][i][3] for s in run_])), OW / OH)
         if out and out[-1][2] == look:
             out[-1][1] = b
         else:
@@ -924,39 +938,271 @@ def h264():
     return _ENCODER
 
 
+def clip_span(words, parts, a):
+    """A clip line's number, its words (i0..j) and its edges (t0, t1): from
+    the first word at START to the end of the sentence at END, or to the word
+    UNTIL names, with --lead before and --tail after."""
+    number = int(re.sub(r'(?i)^clip\s*', '', parts[0]))
+    start_s = secs(re.sub(r'(?i)^start\s*', '', parts[1]))
+    end_s = secs(re.sub(r'(?i)^end\s*', '', parts[2]))
+    until = re.sub(r'(?i)^until\s*', '', parts[5]).strip().lower() if len(parts) > 5 else ''
+    i0 = next(i for i, x in enumerate(words) if x[0] >= start_s - 0.05)
+    j = next(i for i, x in enumerate(words) if x[0] >= end_s - 0.05)
+    norm = lambda s: re.sub(r'[^\w%]', '', s.lower())
+    if until:  # the first word matching LASTWORD at or after END
+        while j < len(words) - 1 and norm(words[j][2]) != norm(until):
+            j += 1
+    else:  # the end of the sentence starting at END
+        while j < len(words) - 1 and not is_end(words[j][2]):
+            j += 1
+    # A breath before the first word and after the last (--lead, --tail),
+    # faded in and out, so a clip does not start or stop on a hard edge.
+    return number, i0, j, max(0.0, words[i0][0] - a.lead), words[j][1] + a.tail
+
+
+def video_size(video):
+    return tuple(int(x) for x in subprocess.check_output(
+        ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height',
+         '-of', 'csv=p=0:s=x', video], text=True).strip().split('x')[:2])
+
+
+# --- framing by hand (--framing) ----------------------------------------------
+#
+# A JSON file, written by a person or an app (Reelcut's Reframe step):
+#
+#   {"clips": {"3": {"ratio": "9:16",
+#                    "scenes": [{"start": 812.4, "layout": "crop",  "boxes": [[x, y, w, h]]},
+#                               {"start": 820.0, "layout": "split", "boxes": [[...], [...]]},
+#                               {"start": 831.7, "layout": "fit"}]}}}
+#
+# Times are seconds into the video; each scene lasts until the next one
+# starts, the first from the clip's start. Boxes are fractions (0..1) of the
+# video's width and height, so they don't depend on the size of a preview.
+# A box is put back into the reel's shape around its centre (half the reel's
+# height each for "split", the first on top) and kept inside the picture.
+# A clip not in the file is framed as --frame says.
+
+LAYOUTS = ('crop', 'split', 'fit')
+
+
+def load_framing(path):
+    data = json.load(open(path))
+    out = {}
+    for key, clip in (data.get('clips') or {}).items():
+        try:
+            number = int(re.sub(r'(?i)^clip\s*', '', str(key)))
+        except ValueError:
+            continue
+        scenes = [sc for sc in clip.get('scenes') or [] if sc.get('layout') in LAYOUTS]
+        if scenes:
+            out[number] = {'ratio': clip.get('ratio') if clip.get('ratio') in RATIOS else None,
+                           'scenes': sorted(scenes, key=lambda sc: float(sc.get('start') or 0))}
+    return out
+
+
+def box_px(box, W, H, aspect):
+    """A box given in fractions (x, y, w, h) as a crop (w, h, x, y) in pixels
+    of the given aspect (w/h): around the box's centre, as tall as it says
+    unless it is wider than that shape allows, and inside the picture."""
+    x, y, bw, bh = (float(v) for v in box)
+    cx, cy = (x + bw / 2) * W, (y + bh / 2) * H
+    ch = max(16.0, bh * H)
+    cw = ch * aspect
+    if cw > W:
+        cw, ch = W, W / aspect
+    if ch > H:
+        ch, cw = H, H * aspect
+    cw, ch = int(cw) // 2 * 2, int(ch) // 2 * 2
+    px = int(min(max(0, cx - cw / 2), W - cw))
+    py = int(min(max(0, cy - ch / 2), H - ch))
+    return cw, ch, px, py
+
+
+def framed_shots(framed, t0, t1, W, H):
+    """The shots of a clip framed by hand: [(start, end, look)], times from t0;
+    a look is a crop, ('stack', top, bottom), or None for fitted."""
+    shots = []
+    scenes = framed['scenes']
+    for k, sc in enumerate(scenes):
+        a = 0.0 if k == 0 else max(0.0, float(sc.get('start') or 0) - t0)
+        b = t1 - t0 if k == len(scenes) - 1 else min(t1 - t0, float(scenes[k + 1].get('start') or 0) - t0)
+        if b - a < 0.04:  # outside this clip, or too short to show
+            continue
+        boxes = sc.get('boxes') or []
+        look = None
+        if sc['layout'] == 'crop' and boxes:
+            look = box_px(boxes[0], W, H, OW / OH)
+        elif sc['layout'] == 'split' and len(boxes) >= 2:
+            look = ('stack', box_px(boxes[0], W, H, OW / (OH // 2)), box_px(boxes[1], W, H, OW / (OH // 2)))
+        if shots and shots[-1][2] == look:  # the same look as before: one shot
+            shots[-1][1] = b
+        else:
+            shots.append([a, b, look])
+    if not shots:
+        return [[0.0, t1 - t0, None]]
+    shots[0][0] = 0.0  # no gap at the start, whatever was dropped
+    return shots
+
+
+def scene_starts(video, t0, t1, threshold, least, fps=2.0):
+    """Where the picture changes within t0..t1 (seconds into the video): a
+    layout switch, a screen share starting or ending, a hard cut. A call's
+    software animates its switches, so frames are compared not with the one
+    before but with the scene's first: a new scene starts where the picture
+    differs from it by more than `threshold` (0..1, mean over a small grey
+    copy) and stays so for over a second. Moving webcams and scrolling text
+    stay well under 0.05. A scene shorter than `least` seconds is merged."""
+    W, H = 64, 36
+    raw = subprocess.run(['ffmpeg', '-loglevel', 'error', '-ss', f'{t0:.3f}', '-t', f'{t1 - t0:.3f}', '-i', video,
+                          '-an', '-vf', f'fps={fps},scale={W}:{H},format=gray', '-f', 'rawvideo', '-'],
+                         capture_output=True).stdout
+    size = W * H
+    frames = [raw[k * size:(k + 1) * size] for k in range(len(raw) // size)]
+
+    def diff(x, y):
+        return sum(abs(p - q) for p, q in zip(x, y)) / (size * 255)
+    starts, ref, hold = [t0], frames[0] if frames else None, int(fps * 1.5)
+    k = 0
+    while k < len(frames):
+        if diff(frames[k], ref) > threshold and all(diff(frames[m], ref) > threshold
+                                                    for m in range(k, min(len(frames), k + hold))):
+            t = t0 + k / fps
+            settled = min(len(frames) - 1, k + hold)
+            if t - starts[-1] >= least and t1 - t >= least:
+                starts.append(t)
+            ref, k = frames[settled], settled  # compare with the picture it settled into
+        k += 1
+    return starts
+
+
+def frame_at(video, t, path, width=960):
+    run('ffmpeg', '-loglevel', 'error', '-y', '-ss', f'{t:.3f}', '-i', video, '-frames:v', '1',
+        '-vf', f'scale={width}:-2', '-q:v', '4', path)
+
+
+def frame_faces(path):
+    """A picture and the faces in it as fractions (x, y, w, h), largest first;
+    no faces where OpenCV or the face model is missing."""
+    try:
+        import cv2
+        img = cv2.imread(path)
+        h, w = img.shape[:2]
+        det = cv2.FaceDetectorYN.create(face_model(), '', (w, h), 0.7, 0.3, 5000)
+        _, faces = det.detect(img)
+    except Exception as e:  # no OpenCV, no network for the model: no guides
+        print(f'  no faces: {e}', file=sys.stderr)
+        return None, []
+    faces = [] if faces is None else sorted(faces, key=lambda f: -f[2] * f[3])
+    if faces:  # a face far smaller than the largest is a picture on the wall
+        big = faces[0][2]
+        faces = [f for f in faces if f[2] >= 0.35 * big]
+    return img, [[round(float(f[0]) / w, 4), round(float(f[1]) / h, 4), round(float(f[2]) / w, 4),
+                  round(float(f[3]) / h, 4)] for f in faces]
+
+
+def norm_box(box_wh, W, H):
+    cw, ch, x, y = box_wh
+    return [round(x / W, 4), round(y / H, 4), round(cw / W, 4), round(ch / H, 4)]
+
+
+def suggest_boxes(img, faces):
+    """Boxes to start from, per ratio: "crop", the largest face (or the
+    middle); "split", the face on top and, below, the shared screen beside
+    it, or the next face. Around a face the box keeps to its webcam tile, as
+    the speaker mode does."""
+    if img is None:
+        H, W = 9, 16
+    else:
+        H, W = img.shape[:2]
+    out = {}
+    for ratio, (ow, oh) in RATIOS.items():
+        full, half = ow / oh, ow / (oh // 2)
+
+        def around(f, aspect, faces_tall, least):
+            fx, fy, fw, fh = f[0] * W, f[1] * H, f[2] * W, f[3] * H
+            if img is not None:
+                return norm_box(face_window(img, W, H, fx + fw / 2, fy + fh / 2, fh, aspect,
+                                            faces=faces_tall, least=least, eyes=0.4), W, H)
+            ch = min(H, max(H * least, fh * faces_tall))
+            cw = min(W, ch * aspect)
+            ch = cw / aspect
+            return norm_box((cw, ch, min(max(0, fx + fw / 2 - cw / 2), W - cw),
+                             min(max(0, fy + fh / 2 - ch * 0.4), H - ch)), W, H)
+
+        def biggest(x0, x1, aspect):
+            cw = x1 - x0
+            ch = cw / aspect
+            if ch > H:
+                ch, cw = H, H * aspect
+            return norm_box((cw, ch, x0 + (x1 - x0 - cw) / 2, (H - ch) / 2), W, H)
+
+        if faces:
+            f = faces[0]
+            crop = around(f, full, 3.2, 0.5)
+            left, right = f[0] * W, (f[0] + f[2]) * W
+            # Faces all on one side and a wide area beside them: a shared
+            # screen or slide, which is the point (webcams in a column, the
+            # screen beside): the face on top, the screen below. Else two
+            # people alike in size: the higher one on top. Else whatever is
+            # beside the face.
+            side = (right + 0.05 * W, W) if W - right > left else (0, left - 0.05 * W)
+            same_side = all(((g[0] + g[2] / 2) < 0.5) == ((f[0] + f[2] / 2) < 0.5) for g in faces)
+            if side[1] - side[0] > 0.5 * W and same_side:
+                split = [around(f, half, 2.2, 0.2), biggest(side[0], side[1], half)]
+            elif len(faces) > 1 and faces[1][2] * faces[1][3] >= 0.5 * f[2] * f[3]:
+                pair = sorted(faces[:2], key=lambda g: g[1])
+                split = [around(pair[0], half, 2.2, 0.2), around(pair[1], half, 2.2, 0.2)]
+            elif side[1] - side[0] > 0.3 * W:
+                split = [around(f, half, 2.2, 0.2), biggest(side[0], side[1], half)]
+            else:
+                split = [around(f, half, 2.2, 0.2), biggest(0, W, half)]
+        else:
+            crop = biggest(0, W, full)
+            split = [biggest(0, W / 2, half), biggest(W / 2, W, half)]
+        out[ratio] = {'crop': [crop], 'split': split}
+    return out
+
+
+def scenes(a):
+    """Per clip of a list: its scenes, a frame of each (JPEG in OUT) with the
+    faces found in it, and boxes to start from: what an app needs to let a
+    person frame each scene by hand for cut --framing. Writes OUT/scenes.json."""
+    words = json.load(open(os.path.join(a.dir, 'words.json')))
+    video = find(a.dir, 'video.*')
+    W, H = video_size(video)
+    os.makedirs(a.out, exist_ok=True)
+    only = {int(x) for x in a.only.split(',') if x.strip()} if a.only else None
+    result = {'video': {'width': W, 'height': H}, 'clips': {}}
+    for parts in clip_lines(a.clips):
+        number, i0, j, t0, t1 = clip_span(words, parts, a)
+        if only and number not in only:
+            continue
+        starts = scene_starts(video, t0, t1, a.threshold, a.least)
+        clip = {'start': round(t0, 3), 'end': round(t1, 3), 'scenes': []}
+        for k, sa in enumerate(starts):
+            sb = starts[k + 1] if k + 1 < len(starts) else t1
+            name = f'{number:02d}-{k + 1}.jpg'
+            path = os.path.join(a.out, name)
+            frame_at(video, sa + (sb - sa) * 0.4, path)
+            img, faces = frame_faces(path)
+            clip['scenes'].append({'start': round(sa, 3), 'end': round(sb, 3), 'frame': name,
+                                   'faces': faces, 'suggest': suggest_boxes(img, faces)})
+        result['clips'][str(number)] = clip
+        print(f'clip {number}: {len(starts)} scene{"s" if len(starts) != 1 else ""}  '
+              + ', '.join(f'{ts(x - t0)}' for x in starts))
+    write_json(os.path.join(a.out, 'scenes.json'), result)
+
+
 def cut(a):
     words = json.load(open(os.path.join(a.dir, 'words.json')))
     video = find(a.dir, 'video.*')
     audio = find(a.dir, 'audio.*') if glob.glob(os.path.join(a.dir, 'audio.*')) else video
     fixes = dict(f.split('=', 1) for f in a.fix)
     os.makedirs(a.out, exist_ok=True)
-    w, h = (int(x) for x in subprocess.check_output(
-        ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height',
-         '-of', 'csv=p=0:s=x', video], text=True).strip().split('x'))
-    # A portrait recording is scaled to 1080x1920 as it is. A landscape one is,
-    # by default, fitted across the width over a blurred, darkened copy of
-    # itself filling the frame ("fit"): nothing is cut off, a speaker or a
-    # slide at the edge stays in. "crop" cuts 9:16 out of its middle instead.
-    mode = a.frame if a.frame != 'auto' else ('fit' if w > h else 'crop')
-    if mode in ('speaker', 'stack') and w <= h:
-        mode = 'crop'  # a portrait recording is already framed
-    if w <= h:
-        frame = 'scale=1080:1920'
-    elif mode == 'fit':
-        frame = ('split[bg][fg];'
-                 '[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,'
-                 'gblur=sigma=40,eq=brightness=-0.12[bg];'
-                 '[fg]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2')
-    else:
-        frame = 'scale=-2:1920,crop=1080:1920'
-    # The hook above the picture when it is a band in the middle; over its
-    # lower part when it fills the frame.
-    band = w > h and mode == 'fit'
-    hook_margin = a.hook_margin if a.hook_margin is not None else (470 if band else 1190)
-    speaker = w > h and mode == 'speaker'
-    stack = w > h and mode == 'stack'
-
-    caption_margin = a.caption_margin if a.caption_margin is not None else 470
+    w, h = video_size(video)
+    # Clips framed by hand (--framing): per clip a ratio and, per scene, a
+    # crop box, two boxes stacked, or the whole picture fitted.
+    framings = load_framing(a.framing) if a.framing else {}
     # Names for the speakers diarize found ("A=Petty,B=Václav"), and where
     # they sit when the voices should not be matched to faces by guess
     # ("A=Petty@left").
@@ -989,25 +1235,35 @@ def cut(a):
         return to_come or speaker_colour(y[3] if len(y) > 3 else None)
 
     only = {int(x) for x in a.only.split(',') if x.strip()} if a.only else None
+    norm = lambda s: re.sub(r'[^\w%]', '', s.lower())
     for n, parts in enumerate(clip_lines(a.clips), 1):
-        if only and int(re.sub(r'(?i)^clip\s*', '', parts[0])) not in only:
+        number, i0, j, t0, t1 = clip_span(words, parts, a)
+        if only and number not in only:
             continue
-        start_s = secs(re.sub(r'(?i)^start\s*', '', parts[1]))
-        end_s = secs(re.sub(r'(?i)^end\s*', '', parts[2]))
         hook = parts[4]
-        until = re.sub(r'(?i)^until\s*', '', parts[5]).strip().lower() if len(parts) > 5 else ''
-        i0 = next(i for i, x in enumerate(words) if x[0] >= start_s - 0.05)
-        j = next(i for i, x in enumerate(words) if x[0] >= end_s - 0.05)
-        norm = lambda s: re.sub(r'[^\w%]', '', s.lower())
-        if until:  # the first word matching LASTWORD at or after END
-            while j < len(words) - 1 and norm(words[j][2]) != norm(until):
-                j += 1
-        else:  # the end of the sentence starting at END
-            while j < len(words) - 1 and not is_end(words[j][2]):
-                j += 1
-        # A breath before the first word and after the last (--lead, --tail),
-        # faded in and out, so a clip does not start or stop on a hard edge.
-        t0, t1 = max(0.0, words[i0][0] - a.lead), words[j][1] + a.tail
+        framed = framings.get(number)
+        canvas((framed or {}).get('ratio') or a.ratio)
+        # A portrait recording is scaled to the reel as it is. A landscape one
+        # is, by default, fitted across the width over a blurred, darkened copy
+        # of itself filling the frame ("fit"): nothing is cut off, a speaker or
+        # a slide at the edge stays in. "crop" cuts the reel's shape out of its
+        # middle instead.
+        mode = a.frame if a.frame != 'auto' else ('fit' if w * OH > h * OW else 'crop')
+        if mode in ('speaker', 'stack') and w <= h:
+            mode = 'crop'  # a portrait recording is already framed
+        if mode == 'fit':
+            frame = fit()
+        else:
+            frame = f'scale={OW}:{OH}:force_original_aspect_ratio=increase,crop={OW}:{OH}'
+        # Margins are given in px of a 1920-high reel; a shorter reel scales them.
+        scale_v = OH / 1920
+        # The hook above the picture when it is a band in the middle; over its
+        # lower part when it fills the frame.
+        band = w > h and mode == 'fit'
+        hv = a.hook_margin if a.hook_margin is not None else (470 if band else 1190)
+        cv = a.caption_margin if a.caption_margin is not None else 470
+        speaker = w > h and mode == 'speaker' and not framed
+        stack = w > h and mode == 'stack' and not framed
         ws, capital = [], False
         for x in words[i0:j + 1]:
             if not a.keep_fillers and norm(x[2]) in FILLERS:
@@ -1038,7 +1294,6 @@ def cut(a):
         dur = t1 - t0
         fd = min(a.fade, dur / 4)
         finish = f"ass={base}.ass,fade=in:st=0:d={fd:.2f},fade=out:st={dur - fd:.2f}:d={fd:.2f}"
-        hv, cv = hook_margin, caption_margin
         turns = clip_turns(words[i0:j + 1], t0, t1) if labelled else None
         # Where each voice sits: as the person said (@left/@right), which is
         # certain and free; else matched from the stretch around the clip,
@@ -1047,6 +1302,12 @@ def cut(a):
         if turns and (stack or speaker) and not told and not (places and learnt[0] <= t0 and t1 <= learnt[1]):
             places, learnt = speaker_places(video, words, t0, t1)
         shots = stack_layout(video, t0, t1, turns=turns, place=place, places=places) if stack else None
+        if framed:
+            shots = framed_shots(framed, t0, t1, w, h)
+            if a.hook_margin is None:
+                hv = 820 if any(c and c[0] == 'stack' for _, _, c in shots) else 470 if shots[0][2] is None else 1190
+            if a.caption_margin is None and any(c and c[0] == 'stack' for _, _, c in shots):
+                cv = 860
         if stack and shots is None:
             print('  not two people on screen for most of it: following the speaker instead')
         if shots:
@@ -1056,13 +1317,13 @@ def cut(a):
                 hv = 820
             if a.caption_margin is None:
                 cv = 860
-        if speaker or stack:
+        if speaker or stack or framed:
             # Each shot with its own look (a crop, two stacked, or fitted
             # where no face is seen), joined, then the captions over all.
             if not shots:
                 shots = (turn_shots(video, t0, t1, turns, place=place, places=places) if turns
                          else speaker_shots(video, t0, t1, audio))
-                if a.hook_margin is None and shots[0][2] is None:
+                if a.hook_margin is None and shots[0][2] is None:  # (automatic shots only)
                     hv = 470  # the first shot is a band: the hook above it
             parts = []
             for k, (sa, sb, crop) in enumerate(shots):
@@ -1074,12 +1335,12 @@ def cut(a):
                     dim = ',eq=brightness=-0.08:saturation=0.8'
                     td = dim if active == 1 else ''
                     bd = dim if active == 0 else ''
-                    parts.append(f'{head},split[t{k}][b{k}];[t{k}]crop={tw}:{th}:{tx}:{ty},scale=1080:960{td},setsar=1[t{k}c];'
-                                 f'[b{k}]crop={bw}:{bh}:{bx}:{by},scale=1080:960{bd},setsar=1[b{k}c];'
+                    parts.append(f'{head},split[t{k}][b{k}];[t{k}]crop={tw}:{th}:{tx}:{ty},scale={OW}:{OH // 4 * 2}{td},setsar=1[t{k}c];'
+                                 f'[b{k}]crop={bw}:{bh}:{bx}:{by},scale={OW}:{OH - OH // 4 * 2}{bd},setsar=1[b{k}c];'
                                  f'[t{k}c][b{k}c]vstack=2,setsar=1[s{k}]')
                     continue
-                look = (f'crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]},scale=1080:1920' if crop
-                        else FIT.format(k=k))
+                look = (f'crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]},scale={OW}:{OH}' if crop
+                        else fit(k))
                 parts.append(f'{head},{look},setsar=1[s{k}]')
             graph = (';'.join(parts) + ';' + ''.join(f'[s{k}]' for k in range(len(shots))) +
                      f'concat=n={len(shots)}:v=1:a=0,{finish}[v]')
@@ -1096,7 +1357,10 @@ def cut(a):
                 if spk in names and tb - ta > 0.8:
                     ev.append(f'Dialogue: 2,{ts(ta)},{ts(min(tb, ta + 2.0))},Name,,0,0,0,,'
                               f'{{\\c{speaker_colour(spk)}}}{esc(names[spk].upper())}')
-        open(base + '.ass', 'w').write(HEAD.format(cap_v=cv, hook_v=hv, name_v=min(cv + 95, 1800)) + '\n'.join(ev) + '\n')
+        cv, hv = round(cv * scale_v), round(hv * scale_v)
+        open(base + '.ass', 'w').write(HEAD.format(ow=OW, oh=OH, cap_v=cv, hook_v=hv,
+                                                   name_v=min(cv + round(95 * scale_v), OH - round(120 * scale_v)))
+                                       + '\n'.join(ev) + '\n')
         run('ffmpeg', '-loglevel', 'error', '-y', '-ss', f'{t0:.2f}', '-i', video, '-ss', f'{t0:.2f}', '-i', audio,
             '-t', f'{dur:.2f}', *video_args,
             '-af', f'afade=in:st=0:d={fd:.2f},afade=out:st={dur - fd:.2f}:d={fd:.2f}',
@@ -1120,8 +1384,8 @@ def with_cards(clip, intro, outro, seconds, fade):
     def card(img):
         nonlocal idx
         inputs.extend(['-loop', '1', '-t', f'{seconds:.2f}', '-i', img])
-        chains.append(f'[{idx}:v]scale=1080:1920:force_original_aspect_ratio=decrease,'
-                      f'pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p,'
+        chains.append(f'[{idx}:v]scale={OW}:{OH}:force_original_aspect_ratio=decrease,'
+                      f'pad={OW}:{OH}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p,'
                       f'fade=in:st=0:d={fd:.2f},fade=out:st={seconds - fd:.2f}:d={fd:.2f}[v{idx}];'
                       f'anullsrc=r=48000:cl=stereo,atrim=0:{seconds:.2f}[a{idx}]')
         labels.append(f'[v{idx}][a{idx}]')
@@ -1214,7 +1478,19 @@ def main():
                    help='the words already said (default: as the ones still to be said)')
     s.add_argument('--caption-margin', type=int, default=None, help='captions, px from the bottom of 1920 (default 470)')
     s.add_argument('--hook-margin', type=int, default=None, help='hook title, px from the top of 1920 (default: above a fitted picture, else 1190)')
+    s.add_argument('--ratio', choices=list(RATIOS), default='9:16', help="the reel's shape (default 9:16)")
+    s.add_argument('--framing', default='', metavar='FILE',
+                   help='clips framed by hand: per clip a ratio and per scene a crop box, two stacked, or fitted '
+                        '(see reelcut scenes; JSON)')
     s.set_defaults(fn=cut)
+    s = sub.add_parser('scenes', help="each clip's scenes, a frame of each, the faces in it: for framing by hand")
+    s.add_argument('dir'); s.add_argument('clips'); s.add_argument('out')
+    s.add_argument('--only', default='', metavar='1,3,5', help='only these clips of the list, by their number')
+    s.add_argument('--lead', type=float, default=0.25, help='as cut --lead, so the clips match (default 0.25)')
+    s.add_argument('--tail', type=float, default=0.4, help='as cut --tail (default 0.4)')
+    s.add_argument('--threshold', type=float, default=0.08, help="how much the picture must change to start a scene (0..1, default 0.08)")
+    s.add_argument('--least', type=float, default=2.0, help='the shortest scene, in seconds (default 2)')
+    s.set_defaults(fn=scenes)
     s = sub.add_parser('page'); s.add_argument('out'); s.add_argument('--title', default='Reels'); s.set_defaults(fn=page)
     a = ap.parse_args()
     a.fn(a)

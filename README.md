@@ -74,6 +74,41 @@ talk most in each clip.
 - `--intro logo.png --outro qr.png --card 2` puts a card before and after:
   an image fitted on black, faded in and out.
 
+## Framing by hand
+
+The automatic layouts follow faces. When the point of a clip is something
+else, a slide or a shared screen beside a column of webcams, frame it
+yourself:
+
+```sh
+reelcut scenes talk talk/clips.txt talk/scenes   # scenes.json + a frame per scene
+# draw your boxes, save them as talk/framing.json
+reelcut cut talk talk/clips.txt talk/reels --framing talk/framing.json
+```
+
+`scenes` splits each clip where the picture changes: a call switching layout,
+a screen share starting or ending, a hard cut (`--threshold`, `--least`). For
+each scene it writes a frame, the faces in it, and boxes to start from for
+each ratio. `framing.json` gives, per clip, the shape of the reel and, per
+scene, its layout:
+
+```json
+{"clips": {"3": {"ratio": "9:16", "scenes": [
+  {"start": 812.4, "layout": "split", "boxes": [[0.0, 0.62, 0.2, 0.36], [0.25, 0.0, 0.63, 1.0]]},
+  {"start": 820.0, "layout": "crop",  "boxes": [[0.4, 0.05, 0.2, 0.95]]},
+  {"start": 831.7, "layout": "fit"}]}}}
+```
+
+- `crop`: one box, the reel's shape;
+- `split`: two boxes, the first above the second, half the reel each;
+- `fit`: the whole picture across the reel over a blurred copy of itself.
+
+Times are seconds into the video, and each scene lasts until the next.
+Boxes are fractions of the video's width and height (x, y, w, h), put back
+into the reel's shape around their centre. Ratios are `9:16`, `4:5` and
+`1:1`; `cut --ratio` sets one for every clip. A clip missing from the file
+is framed by `--frame` as before.
+
 ## The clips file
 
 One clip per line, as `reelcut prompt` asks for:
