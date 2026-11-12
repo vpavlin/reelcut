@@ -45,7 +45,11 @@ def write_json(path, data):
 
 
 def find(d, pattern):
-    hits = sorted(glob.glob(os.path.join(d, pattern)))
+    # Not what a download left half done (.part, .ytdl, a .fNNN piece of a
+    # merge, .temp): sorted first, one of those was taken for the recording.
+    left = re.compile(r'\.(part|ytdl|temp)(\.|$)|\.f[0-9]+[-.]')
+    hits = sorted(glob.glob(os.path.join(d, pattern)), key=lambda f: (not f.endswith('.mp4'), f))
+    hits = [f for f in hits if not left.search(os.path.basename(f)) and os.path.getsize(f) > 0]
     if not hits:
         sys.exit(f'reelcut: no {pattern} in {d}')
     return hits[0]
@@ -476,6 +480,10 @@ def face_samples(video, t0, t1, fps=5.0):
     cap = cv2.VideoCapture(video)
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
     W, H = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if not cap.isOpened() or W <= 0 or H <= 0:
+        size = os.path.getsize(video) if os.path.exists(video) else 'missing'
+        sys.exit(f'reelcut: cannot read the picture of {os.path.basename(video)} ({size} bytes); '
+                 f'download the video again (Retry on Download)')
     sc = 640 / W
     det = cv2.FaceDetectorYN.create(face_model(), '', (640, int(H * sc)), 0.7, 0.3, 5000)
     cap.set(cv2.CAP_PROP_POS_MSEC, t0 * 1000)
