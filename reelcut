@@ -1018,7 +1018,9 @@ def video_size(video):
 #   {"clips": {"3": {"ratio": "9:16",
 #                    "scenes": [{"start": 812.4, "layout": "crop",  "boxes": [[x, y, w, h]]},
 #                               {"start": 820.0, "layout": "split", "boxes": [[...], [...]]},
-#                               {"start": 831.7, "layout": "fit"}]}}}
+#                               {"start": 831.7, "layout": "fit"},
+#                               {"start": 840.2, "layout": "panels", "bg": "blur",
+#                                "panels": [{"src": [x, y, w, h], "dst": [x, y, w, h]}, ...]}]}}}
 #
 # Times are seconds into the video; each scene lasts until the next one
 # starts, the first from the clip's start. Boxes are fractions (0..1) of the
@@ -1026,8 +1028,38 @@ def video_size(video):
 # A box is put back into the reel's shape around its centre (half the reel's
 # height each for "split", the first on top) and kept inside the picture.
 # A clip not in the file is framed as --frame says.
+#
+# "panels" is the general one: any number of pieces of the picture (src,
+# fractions of the video), each put where dst says on the reel (fractions of
+# the reel), over a background: "blur" (the picture, blurred), "black", or a
+# colour "#RRGGBB". A src is put back into its dst's shape around its centre.
+# The first panel is drawn first, so a later one covers it where they meet.
 
-LAYOUTS = ('crop', 'split', 'fit')
+LAYOUTS = ('crop', 'split', 'fit', 'panels')
+
+
+def panel_px(panel, W, H):
+    """A panel as ((w, h, x, y) crop of the video, (w, h, x, y) on the reel),
+    in pixels, even, inside both; None when it is too small to show."""
+    try:
+        dx, dy, dw, dh = (min(1.0, max(0.0, float(v))) for v in panel['dst'])
+        src = [float(v) for v in panel['src']]
+    except (KeyError, TypeError, ValueError):
+        return None
+    ow, oh = int(dw * OW) // 2 * 2, int(dh * OH) // 2 * 2
+    if ow < 16 or oh < 16:
+        return None
+    ox = min(int(dx * OW) // 2 * 2, OW - ow)
+    oy = min(int(dy * OH) // 2 * 2, OH - oh)
+    return box_px(src, W, H, ow / oh), (ow, oh, ox, oy)
+
+
+def bg_colour(bg):
+    if bg == 'black':
+        return '#000000'
+    if isinstance(bg, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', bg):
+        return bg
+    return None  # blur
 
 
 def load_framing(path):
@@ -1079,6 +1111,10 @@ def framed_shots(framed, t0, t1, W, H):
             look = box_px(boxes[0], W, H, OW / OH)
         elif sc['layout'] == 'split' and len(boxes) >= 2:
             look = ('stack', box_px(boxes[0], W, H, OW / (OH // 2)), box_px(boxes[1], W, H, OW / (OH // 2)))
+        elif sc['layout'] == 'panels':
+            ps = tuple(p for p in (panel_px(p, W, H) for p in (sc.get('panels') or [])[:12]) if p)
+            if ps:
+                look = ('panels', bg_colour(sc.get('bg')), ps)
         if shots and shots[-1][2] == look:  # the same look as before: one shot
             shots[-1][1] = b
         else:
@@ -1353,6 +1389,9 @@ def cut(a):
                 hv = 820 if any(c and c[0] == 'stack' for _, _, c in shots) else 470 if shots[0][2] is None else 1190
             if a.caption_margin is None and any(c and c[0] == 'stack' for _, _, c in shots):
                 cv = 860
+            if any(c and c[0] == 'panels' and len(c[2]) > 1 for _, _, c in shots):
+                hv = 820 if a.hook_margin is None else hv
+                cv = 860 if a.caption_margin is None else cv
         if stack and shots is None:
             print('  not two people on screen for most of it: following the speaker instead')
         if shots:
@@ -1384,6 +1423,20 @@ def cut(a):
                                  f'[b{k}]crop={bw}:{bh}:{bx}:{by},scale={OW}:{OH - OH // 4 * 2}{bd},setsar=1[b{k}c];'
                                  f'[t{k}c][b{k}c]vstack=2,setsar=1[s{k}]')
                     continue
+                if crop and crop[0] == 'panels':
+                    _, colour, ps = crop
+                    n = len(ps)
+                    g = f'{head},split={n + 1}' + ''.join(f'[p{k}_{i}]' for i in range(n + 1)) + ';'
+                    if colour:
+                        g += f'[p{k}_0]scale={OW}:{OH},drawbox=x=0:y=0:w=iw:h=ih:color={colour}@1:t=fill,setsar=1[q{k}_0];'
+                    else:
+                        g += (f'[p{k}_0]scale={OW}:{OH}:force_original_aspect_ratio=increase,crop={OW}:{OH},'
+                              f'gblur=sigma=40,eq=brightness=-0.12,setsar=1[q{k}_0];')
+                    for i, ((cw, ch, cx, cy), (pw, ph, px, py)) in enumerate(ps, 1):
+                        g += f'[p{k}_{i}]crop={cw}:{ch}:{cx}:{cy},scale={pw}:{ph},setsar=1[c{k}_{i}];'
+                        g += f'[q{k}_{i - 1}][c{k}_{i}]overlay={px}:{py}' + (f'[q{k}_{i}];' if i < n else f',setsar=1[s{k}]')
+                    parts.append(g)
+                    continue
                 look = (f'crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]},scale={OW}:{OH}' if crop
                         else fit(k))
                 parts.append(f'{head},{look},setsar=1[s{k}]')
@@ -1391,7 +1444,8 @@ def cut(a):
                      f'concat=n={len(shots)}:v=1:a=0,{finish}[v]')
             video_args = ['-filter_complex', graph, '-map', '[v]', '-map', '1:a']
             print(f'  {len(shots)} shots: ' + ', '.join(
-                f"{sa:.1f}-{sb:.1f} " + ('fit' if c is None else 'stacked' if c[0] == 'stack' else f'{c[0]}x{c[1]}')
+                f"{sa:.1f}-{sb:.1f} " + ('fit' if c is None else 'stacked' if c[0] == 'stack'
+                                         else f'{len(c[2])} panels' if c[0] == 'panels' else f'{c[0]}x{c[1]}')
                 for sa, sb, c in shots))
         else:
             video_args = ['-map', '0:v', '-map', '1:a', '-vf', f'{frame},{finish}']
