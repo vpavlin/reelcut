@@ -57,7 +57,37 @@ def find(d, pattern):
 
 # --- fetch -------------------------------------------------------------------
 
-def download(a, name, ways, extra=()):
+def whole_video(d):
+    """Why the downloaded video is not whole, or None. yt-dlp has ended with
+    success on a video cut short (156 of 203 MB, no index: unreadable)."""
+    vids = [f for f in glob.glob(os.path.join(d, 'video.*')) if not f.endswith(('.part', '.ytdl'))]
+    if not vids:
+        return 'no video file'
+    r = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                        'stream=width,height:format=duration', '-of', 'json', vids[0]],
+                       capture_output=True, text=True)
+    try:
+        info = json.loads(r.stdout)
+        st, dur = info['streams'][0], float(info['format']['duration'])
+        assert st['width'] > 0 and st['height'] > 0
+    except Exception:
+        return 'the video file is unreadable (' + (r.stderr.strip().splitlines() or ['no picture'])[-1] + ')'
+    try:
+        want = float(open(os.path.join(d, 'meta.tsv')).read().split('\t')[2])
+    except Exception:
+        want = 0
+    if want > 0 and dur < want * 0.97:
+        return f'the video stops at {dur:.0f} s of {want:.0f} s'
+    # The index can be whole and the end missing: a frame near the end.
+    end = max(0.0, dur - 10)
+    r = subprocess.run(['ffmpeg', '-v', 'error', '-ss', f'{end:.1f}', '-i', vids[0], '-frames:v', '1',
+                        '-f', 'framemd5', '-'], capture_output=True, text=True)
+    if not any(l.startswith('0,') for l in r.stdout.splitlines()):
+        return f'the video has no picture after about {end:.0f} s'
+    return None
+
+
+def download(a, name, ways, extra=(), check=None):
     """One download, tried several ways: YouTube answers some requests with
     a 403 depending on the client yt-dlp poses as and the format (audio
     and video alike, intermittently), so another client, then a plainer
@@ -71,7 +101,12 @@ def download(a, name, ways, extra=()):
                             '-o', os.path.join(a.dir, name + '.%(ext)s'), a.url],
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if r.returncode == 0:
-            return
+            why = check() if check else None
+            if not why:
+                return
+            tried.append(why)
+            print(f'reelcut: the {name} download is not whole ({why}); trying another way', file=sys.stderr)
+            continue
         lines = r.stderr.strip().splitlines()
         why = ([l for l in lines if l.startswith('ERROR')] or lines[-1:] or [f'exit {r.returncode}'])[-1]
         tried.append(why)
@@ -89,8 +124,9 @@ def fetch(a):
     # The audio first: transcription can start on it while the video comes.
     # A plainer format last: "251-20" and the like are variants of a track,
     # which a 403 can hit where the plain one is fine.
-    download(a, 'audio', [['-f', 'bestaudio'], ['-f', 'bestaudio', *OTHER_CLIENTS],
-                          ['-f', 'bestaudio[format_id!*=-]/bestaudio', *OTHER_CLIENTS]], meta)
+    if a.only != 'video':
+        download(a, 'audio', [['-f', 'bestaudio'], ['-f', 'bestaudio', *OTHER_CLIENTS],
+                              ['-f', 'bestaudio[format_id!*=-]/bestaudio', *OTHER_CLIENTS]], meta)
     # Ranked, not filtered: up to 1080p by the shorter side (yt-dlp's res, so
     # a portrait 1080x1920 counts as 1080), then plain https over HLS, whose
     # small fragments come throttled (a 97-minute video at 300 KB/s, and as
@@ -98,7 +134,8 @@ def fetch(a):
     # 720p (1080p answered 403 on scribe's box, 2026-10-14).
     best = ['-f', 'bv*', '-S', 'res:1080,proto:https,vcodec:h264,ext:mp4']
     download(a, 'video', [best, best + OTHER_CLIENTS, ['-f', 'bv*', '-S', 'res:720,proto:https,vcodec:h264,ext:mp4']],
-             ['--remux-video', 'mp4'])
+             ['--remux-video', 'mp4'] + (meta if a.only == 'video' else []),
+             check=lambda: whole_video(a.dir))
     print(open(os.path.join(a.dir, 'meta.tsv')).read().strip())
 
 
@@ -1444,7 +1481,9 @@ figcaption{{padding:10px 12px;font-size:.92rem}} figcaption a{{float:right;color
 def main():
     ap = argparse.ArgumentParser(prog='reelcut', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    s = sub.add_parser('fetch'); s.add_argument('url'); s.add_argument('dir'); s.set_defaults(fn=fetch)
+    s = sub.add_parser('fetch'); s.add_argument('url'); s.add_argument('dir')
+    s.add_argument('--only', choices=['video'], help='the video again, the audio and transcript kept')
+    s.set_defaults(fn=fetch)
     s = sub.add_parser('transcribe'); s.add_argument('dir')
     s.add_argument('--threads', type=int, default=4, help='per piece (default 4)')
     s.add_argument('--jobs', type=int, default=0, help='pieces at once (default: cores / threads)')
