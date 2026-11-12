@@ -101,7 +101,19 @@ scene, its layout:
 
 - `crop`: one box, the reel's shape;
 - `split`: two boxes, the first above the second, half the reel each;
-- `fit`: the whole picture across the reel over a blurred copy of itself.
+- `fit`: the whole picture across the reel over a blurred copy of itself;
+- `panels`: any number of boxes (up to 12), each a piece of the picture placed
+  anywhere on the reel, over a background:
+
+  ```json
+  {"start": 840.2, "layout": "panels", "bg": "black", "panels": [
+    {"src": [0.02, 0.30, 0.15, 0.20], "dst": [0.0, 0.0, 1.0, 0.42]},
+    {"src": [0.22, 0.05, 0.75, 0.85], "dst": [0.0, 0.42, 1.0, 0.58]}]}
+  ```
+
+  `src` is in fractions of the video, `dst` in fractions of the reel; a
+  `src` is put into its `dst`'s shape around its middle. `bg` is `blur` (the
+  picture, blurred), `black`, or `#RRGGBB`. A later box covers an earlier one.
 
 Times are seconds into the video, and each scene lasts until the next.
 Boxes are fractions of the video's width and height (x, y, w, h), put back
