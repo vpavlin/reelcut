@@ -7,6 +7,7 @@
   reelcut scenes DIR CLIPS OUT      each clip's scenes and a frame of each, to frame by hand
   reelcut cut DIR CLIPS OUT         the reels, from a list of clips
   reelcut page OUT [--title T]      an index.html that plays them
+  reelcut probe DIR / thumbs OUT    the video's size and a frame; the reels' frames and lengths
 
 DIR holds one recording: audio.*, video.mp4, and what transcribe writes
 (words.json, transcript-ts.txt, transcript.txt). The steps are separate so a
@@ -1551,6 +1552,34 @@ figcaption{{padding:10px 12px;font-size:.92rem}} figcaption a{{float:right;color
     print(os.path.join(a.out, 'index.html'))
 
 
+def probe(a):
+    """The video's size into DIR/.size ("WxH") and one frame of it into DIR/frame.jpg (640 wide)."""
+    v = next((os.path.join(a.dir, f) for f in sorted(os.listdir(a.dir))
+              if f.startswith('video.') and not f.endswith(('.part', '.ytdl', '.temp', '.tmp'))), None)
+    if not v:
+        return
+    try:
+        w, h = video_size(v)
+        open(os.path.join(a.dir, '.size'), 'w').write(f'{w}x{h}\n')
+    except Exception as e:
+        print(f'probe: no size: {e}', file=sys.stderr)
+    subprocess.run(['ffmpeg', '-loglevel', 'error', '-y', '-ss', str(max(0, a.at)), '-i', v, '-frames:v', '1',
+                    '-vf', 'scale=640:-2', os.path.join(a.dir, 'frame.jpg')])
+
+
+def thumbs(a):
+    """For every reel in OUT: a frame 2 s in (NAME.jpg, 360 wide) and its length in seconds (NAME.dur)."""
+    for f in sorted(os.listdir(a.out)):
+        if not f.endswith('.mp4'):
+            continue
+        src, base = os.path.join(a.out, f), os.path.join(a.out, f[:-4])
+        subprocess.run(['ffmpeg', '-loglevel', 'error', '-y', '-ss', '2', '-i', src, '-frames:v', '1',
+                        '-vf', 'scale=360:-2', base + '.jpg'])
+        d = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', src],
+                           capture_output=True, text=True).stdout
+        open(base + '.dur', 'w').write(d)
+
+
 def main():
     ap = argparse.ArgumentParser(prog='reelcut', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -1611,6 +1640,11 @@ def main():
     s.add_argument('--threshold', type=float, default=0.08, help="how much the picture must change to start a scene (0..1, default 0.08)")
     s.add_argument('--least', type=float, default=2.0, help='the shortest scene, in seconds (default 2)')
     s.set_defaults(fn=scenes)
+    s = sub.add_parser('probe', help="the video's size (DIR/.size) and one frame of it (DIR/frame.jpg)")
+    s.add_argument('dir'); s.add_argument('--at', type=float, default=60, help='seconds into the video (default 60)')
+    s.set_defaults(fn=probe)
+    s = sub.add_parser('thumbs', help='for every reel in OUT a frame (NAME.jpg) and its length (NAME.dur)')
+    s.add_argument('out'); s.set_defaults(fn=thumbs)
     s = sub.add_parser('page'); s.add_argument('out'); s.add_argument('--title', default='Reels'); s.set_defaults(fn=page)
     a = ap.parse_args()
     a.fn(a)
