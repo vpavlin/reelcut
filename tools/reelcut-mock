@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""reelcut-mock: the reelcut command line without the work. Same commands, flags and files as
+reelcut, made up in seconds with the standard library only: a fake transcript, one placeholder
+frame, two-second placeholder reels. For testing a Reelcut worker (remote execution, the
+market, payments) on a machine with no podman, models or GPU. Put it on PATH as `reelcut` and
+set the worker's runner to "reelcut on PATH". REELCUT_MOCK_SECONDS stretches each step (default 3).
+"""
+import argparse, base64, json, os, re, sys, time
+
+JPG = base64.b64decode("/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYwLjMxLjEwMgD/2wBDAAgoKC8oLzc3Nzc3N0E8QUNDQ0FBQUFDQ0NISEhVVVVISEhDQ0hIUFBVVVxfXFdXVVdfX2RkZHh4c3OMjJGsrM//xABMAAEBAAAAAAAAAAAAAAAAAAAABgEBAQAAAAAAAAAAAAAAAAAAAAUQAQAAAAAAAAAAAAAAAAAAAAARAQAAAAAAAAAAAAAAAAAAAAD/wAARCAFoAoADASIAAhEAAxEA/9oADAMBAAIRAxEAPwCOAV0wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB//2Q==")
+MP4 = base64.b64decode("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AQAAAC0AAAABAAAAYnVkdGEAAABabWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAtaWxzdAAAACWpdG9vAAAAHWRhdGEAAAABAAAAAExhdmY2MC4xNi4xMDAAAAAIZnJlZQAACtBtZGF03gIATGF2YzYwLjMxLjEwMgACMEAOAAACVAYF//9Q3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTEgZGVibG9jaz0wOjA6MCBhbmFseXNlPTA6MCBtZT1kaWEgc3VibWU9MCBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MCA4eDhkY3Q9MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0wIHRocmVhZHM9NiBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTAgd2VpZ2h0cD0wIGtleWludD0yNTAga2V5aW50X21pbj0xMCBzY2VuZWN1dD0wIGludHJhX3JlZnJlc2g9MCByYz1jcmYgbWJ0cmVlPTAgY3JmPTQ1LjAgcWNvbXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlvPTEuNDAgYXE9MACAAAACwmWIhDoRigAEY5jjJycnJycnJycnJycnJycnJycnJycnJ1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111114BGCAHARggBwEYIAcAAAQbQZogNr1r619a+tfWvrX1r619a+tfWvrX1r619a+tfWvrX1r619a+tfWs/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/n8/gEYIAcBGCAHAAAAB0GaQDaAHMwBGCAHARggBwAAAAdBmmA6gBzMARggBwEYIAcAAAAHQZqAOoAczAEYIAcBGCAHAAAAB0GaoDqAHMwBGCAHARggBwAAAAdBmsA6gBzMARggBwEYIAcBGCAHAAAAB0Ga4DqAHMwBGCAHARggBwAAAAdBmwA6gBzMARggBwEYIAcAAAAHQZsgOoAczAEYIAcBGCAHAAAAB0GbQDqAHMwBGCAHARggBwAAAAdBm2A6gBzMARggBwEYIAcAAAAHQZuAOoAczAEYIAcBGCAHAAAAB0GboDqAHMwBGCAHARggBwEYIAcAAAAHQZvAOoAczAEYIAcBGCAHAAAAB0Gb4DqAHMwBGCAHARggBwAAAAdBmgA6gBzMARggBwEYIAcAAAAHQZogOoAczAEYIAcBGCAHAAAAB0GaQDqAHMwBGCAHARggBwAAAAdBmmA6gBzMARggBwEYIAcBGCAH")
+SLOW = float(os.environ.get('REELCUT_MOCK_SECONDS', '3'))
+LOREM = ("so the idea was simple we wanted a calendar that nobody owns and it turned out to be the hard "
+         "part because every phone has to agree on what happened when nobody is online and that is "
+         "exactly where the fun starts").split()
+
+
+def hms(t):
+    t = int(t)
+    return f'{t // 3600}:{t // 60 % 60:02d}:{t % 60:02d}'
+
+
+def secs(s):
+    p = [float(x) for x in s.split(':')]
+    return p[0] * 3600 + p[1] * 60 + p[2] if len(p) == 3 else p[0] * 60 + p[1]
+
+
+def work(steps, label=''):
+    for i in range(1, steps + 1):
+        time.sleep(SLOW / steps)
+        print(f'\r{i}/{steps}', end='', file=sys.stderr, flush=True)
+    print(file=sys.stderr)
+
+
+def duration(d):
+    try:
+        return float(open(os.path.join(d, 'meta.tsv')).read().split('\t')[2])
+    except Exception:
+        return 300.0
+
+
+def words_of(d):
+    return json.load(open(os.path.join(d, 'words.json')))
+
+
+def write_transcripts(d, words):
+    lines, cur = [], []
+    for w in words:
+        cur.append(w)
+        if len(cur) >= 12:
+            lines.append(cur); cur = []
+    if cur:
+        lines.append(cur)
+    with open(os.path.join(d, 'transcript-ts.txt'), 'w') as f:
+        for s in lines:
+            who = f'{s[0][3]}: ' if len(s[0]) > 3 and s[0][3] else ''
+            f.write(f'[{hms(s[0][0])}] {who}' + ' '.join(w[2] for w in s) + '.\n')
+    with open(os.path.join(d, 'transcript.txt'), 'w') as f:
+        f.write(' '.join(w[2] for w in words) + '\n')
+
+
+def fetch(a):
+    os.makedirs(a.dir, exist_ok=True)
+    m = re.search(r'[?&]t=(\d+)', a.url)
+    dur = 300.0
+    if a.only != 'video':
+        open(os.path.join(a.dir, 'meta.tsv'), 'w').write(f'Mock video ({a.url[-24:]})\tMock channel\t{dur:.0f}\t20261113\n')
+        work(2)
+        open(os.path.join(a.dir, 'audio.m4a'), 'wb').write(MP4)
+    work(2)
+    open(os.path.join(a.dir, 'video.mp4'), 'wb').write(MP4)
+    print(open(os.path.join(a.dir, 'meta.tsv')).read().strip())
+
+
+def transcribe(a):
+    dur = duration(a.dir)
+    n = max(1, int(dur // 60))
+    print(f'{n} pieces of 60 s, 1 at a time, 4 threads each', file=sys.stderr)
+    work(n)
+    words, t, i = [], 0.5, 0
+    while t < dur - 1:
+        words.append([round(t, 2), round(t + 0.35, 2), LOREM[i % len(LOREM)]])
+        t += 0.45; i += 1
+    if os.path.exists(os.path.join(a.dir, 'diarization.json')):
+        words = label(a.dir, words)
+    json.dump(words, open(os.path.join(a.dir, 'words.json'), 'w'))
+    write_transcripts(a.dir, words)
+    print(f'{len(words)} words: {os.path.join(a.dir, "transcript-ts.txt")}')
+
+
+def label(d, words):
+    segs = json.load(open(os.path.join(d, 'diarization.json')))
+    out = []
+    for w in words:
+        mid = (w[0] + w[1]) / 2
+        sp = next((s[2] for s in segs if s[0] <= mid <= s[1]), segs[-1][2] if segs else 'A')
+        out.append([w[0], w[1], w[2], sp])
+    return out
+
+
+def diarize(a):
+    dur = duration(a.dir)
+    k = a.speakers or 2
+    work(3)
+    segs, t, i = [], 0.0, 0
+    while t < dur:
+        segs.append([round(t, 2), round(min(dur, t + 20), 2), 'ABCDEFGH'[i % k]])
+        t += 20; i += 1
+    json.dump(segs, open(os.path.join(a.dir, 'diarization.json'), 'w'))
+    if os.path.exists(os.path.join(a.dir, 'words.json')):
+        w = label(a.dir, words_of(a.dir))
+        json.dump(w, open(os.path.join(a.dir, 'words.json'), 'w'))
+        write_transcripts(a.dir, w)
+        print(f'{os.path.join(a.dir, "transcript-ts.txt")} now says who said each sentence ("[0:03:42] B: …")')
+
+
+def prompt(a):
+    brief = a.brief or (open(a.brief_file).read() if a.brief_file else '')
+    print(f'Propose {a.n} clips, {a.min}-{a.max} seconds each. {brief}\n')
+    print(open(os.path.join(a.dir, 'transcript-ts.txt')).read())
+
+
+def clip_lines(path):
+    out = []
+    for line in open(path):
+        p = [x.strip() for x in line.split('|')]
+        if len(p) >= 5 and p[0].isdigit():
+            out.append(p)
+    return out
+
+
+def slug(s):
+    return re.sub(r'[^a-z0-9]+', '-', s.lower()).strip('-')[:40] or 'clip'
+
+
+def picked(a):
+    only = {int(x) for x in a.only.split(',') if x.strip()} if a.only else None
+    return [p for p in clip_lines(a.clips) if not only or int(p[0]) in only]
+
+
+def cut(a):
+    os.makedirs(a.out, exist_ok=True)
+    for p in picked(a):
+        work(2)
+        name = f'{int(p[0]):02d}-{slug(p[4])}'
+        open(os.path.join(a.out, name + '.mp4'), 'wb').write(MP4)
+        open(os.path.join(a.out, name + '.ass'), 'w').write('[Script Info]\n; mock\n')
+        print(f'{os.path.join(a.out, name + ".mp4")} {max(1, int(secs(p[2]) - secs(p[1])))}s')
+
+
+def scenes(a):
+    os.makedirs(a.out, exist_ok=True)
+    result = {'video': {'width': 1920, 'height': 1080}, 'clips': {}}
+    for p in picked(a):
+        work(1)
+        t0, t1 = secs(p[1]), max(secs(p[2]), secs(p[1]) + 10)
+        n = int(p[0])
+        starts = [t0, t0 + (t1 - t0) / 2]
+        clip = {'start': t0, 'end': t1, 'scenes': []}
+        for k, sa in enumerate(starts):
+            sb = starts[k + 1] if k + 1 < len(starts) else t1
+            name = f'{n:02d}-{k + 1}.jpg'
+            open(os.path.join(a.out, name), 'wb').write(JPG)
+            clip['scenes'].append({'start': sa, 'end': sb, 'frame': name, 'faces': [[0.4, 0.25, 0.2, 0.35]],
+                                   'suggest': {'9:16': [[0.34, 0.0, 0.32, 1.0]], '4:5': [[0.28, 0.0, 0.44, 1.0]],
+                                               '1:1': [[0.22, 0.0, 0.56, 1.0]]}})
+        result['clips'][str(n)] = clip
+        print(f'clip {n}: {len(starts)} scenes  0:00:00.00, {hms(starts[1] - t0)}')
+    json.dump(result, open(os.path.join(a.out, 'scenes.json'), 'w'))
+
+
+def probe(a):
+    if not any(f.startswith('video.') for f in os.listdir(a.dir)):
+        return
+    open(os.path.join(a.dir, '.size'), 'w').write('1920x1080\n')
+    open(os.path.join(a.dir, 'frame.jpg'), 'wb').write(JPG)
+
+
+def thumbs(a):
+    for f in sorted(os.listdir(a.out)):
+        if f.endswith('.mp4'):
+            open(os.path.join(a.out, f[:-4] + '.jpg'), 'wb').write(JPG)
+            open(os.path.join(a.out, f[:-4] + '.dur'), 'w').write('2.000000\n')
+
+
+def page(a):
+    clips = sorted(f for f in os.listdir(a.out) if f.endswith('.mp4'))
+    open(os.path.join(a.out, 'index.html'), 'w').write(
+        f'<!doctype html><title>{a.title}</title>' + ''.join(f'<video src="{c}" controls></video>' for c in clips))
+    print(os.path.join(a.out, 'index.html'))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='reelcut', description=__doc__)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('fetch'); s.add_argument('url'); s.add_argument('dir'); s.add_argument('--only', default=''); s.set_defaults(fn=fetch)
+    s = sub.add_parser('transcribe'); s.add_argument('dir'); s.add_argument('--threads', type=int); s.add_argument('--jobs', type=int); s.set_defaults(fn=transcribe)
+    s = sub.add_parser('diarize'); s.add_argument('dir'); s.add_argument('--speakers', type=int, default=0)
+    s.add_argument('--threshold', type=float); s.add_argument('--threads', type=int); s.set_defaults(fn=diarize)
+    s = sub.add_parser('prompt'); s.add_argument('dir'); s.add_argument('-n', type=int, default=6); s.add_argument('--brief', default='')
+    s.add_argument('--brief-file', default=''); s.add_argument('--min', type=int, default=20); s.add_argument('--max', type=int, default=55); s.set_defaults(fn=prompt)
+    for name, fn in (('cut', cut), ('scenes', scenes)):
+        s = sub.add_parser(name); s.add_argument('dir'); s.add_argument('clips'); s.add_argument('out'); s.add_argument('--only', default='')
+        for f in ('--lead', '--tail', '--fade', '--card', '--threshold', '--least'): s.add_argument(f, type=float)
+        for f in ('--intro', '--outro', '--speakers', '--frame', '--colour', '--color', '--saying-colour', '--saying-color',
+                  '--said-colour', '--said-color', '--ratio', '--framing'): s.add_argument(f, default='')
+        s.add_argument('--fix', action='append', default=[]); s.add_argument('--keep-fillers', action='store_true')
+        s.add_argument('--caption-margin', type=int); s.add_argument('--hook-margin', type=int); s.set_defaults(fn=fn)
+    s = sub.add_parser('probe'); s.add_argument('dir'); s.add_argument('--at', type=float, default=60); s.set_defaults(fn=probe)
+    s = sub.add_parser('thumbs'); s.add_argument('out'); s.set_defaults(fn=thumbs)
+    s = sub.add_parser('page'); s.add_argument('out'); s.add_argument('--title', default='Reels'); s.set_defaults(fn=page)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == '__main__':
+    main()
